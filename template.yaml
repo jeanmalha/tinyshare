@@ -120,50 +120,6 @@ Resources:
         SigningBehavior: always
         SigningProtocol: sigv4
 
-  ExpiryCheckFunction:
-    Type: AWS::CloudFront::Function
-    Properties:
-      Name: !Sub '${AWS::StackName}-expiry-check'
-      AutoPublish: true
-      FunctionConfig:
-        Comment: Validates share link expiry and resolves aliases
-        Runtime: cloudfront-js-2.0
-        KeyValueStoreAssociations:
-          - KeyValueStoreARN: !GetAtt AliasStore.Arn
-      FunctionCode: |
-        import cf from 'cloudfront';
-        const kvsHandle = cf.kvs();
-
-        async function handler(event) {
-            var uri = event.request.uri;
-            var parts = uri.replace(/^\/+/, '').split('/');
-
-            // Single segment that is not a 10-digit epoch → alias lookup
-            if (parts.length === 1 && parts[0].length > 0 && !/^\d{10}$/.test(parts[0])) {
-                try {
-                    var target = await kvsHandle.get(parts[0]);
-                    return { statusCode: 302, statusDescription: 'Found', headers: { 'location': { value: '/' + target }, 'cache-control': { value: 'no-store' } } };
-                } catch (e) {
-                    return { statusCode: 404, statusDescription: 'Not Found', headers: { 'content-type': { value: 'text/plain' } }, body: 'Not found' };
-                }
-            }
-
-            if (parts.length < 2 || !/^\d{10}$/.test(parts[0])) {
-                return { statusCode: 400, statusDescription: 'Bad Request', headers: { 'content-type': { value: 'text/plain' } }, body: 'Invalid link' };
-            }
-            if (Math.floor(Date.now() / 1000) > parseInt(parts[0], 10)) {
-                return { statusCode: 410, statusDescription: 'Gone', headers: { 'content-type': { value: 'text/html' }, 'cache-control': { value: 'no-store' } }, body: '<!DOCTYPE html><html><head><title>Expired</title><style>body{font-family:system-ui;max-width:400px;margin:80px auto;text-align:center;color:#555}h1{color:#222}</style></head><body><h1>Link expired</h1><p>This share link is no longer valid.</p></body></html>' };
-            }
-            // Check download limit (dl: prefix in KVS)
-            try {
-                var dlCount = await kvsHandle.get('dl:' + parts[1]);
-                if (parseInt(dlCount, 10) === 0) {
-                    return { statusCode: 410, statusDescription: 'Gone', headers: { 'content-type': { value: 'text/html' }, 'cache-control': { value: 'no-store' } }, body: '<!DOCTYPE html><html><head><title>Link used</title><style>body{font-family:system-ui;max-width:400px;margin:80px auto;text-align:center;color:#555}h1{color:#222}</style></head><body><h1>Link already used</h1><p>This link has reached its download limit. Contact the sender to request a new one.</p></body></html>' };
-                }
-            } catch(e) { /* no limit set — proceed */ }
-            return event.request;
-        }
-
   ViewerResponseFunction:
     Type: AWS::Lambda::Function
     Properties:
@@ -205,11 +161,26 @@ Resources:
               req.on('error',rej);if(payload)req.write(payload);req.end();
             });
           }
+          const GONE_EXP='<!DOCTYPE html><html><head><title>Expired</title><style>body{font-family:system-ui;max-width:400px;margin:80px auto;text-align:center;color:#555}h1{color:#222}</style></head><body><h1>Link expired</h1><p>This share link is no longer valid.</p></body></html>';
+          const GONE_DL='<!DOCTYPE html><html><head><title>Link used</title><style>body{font-family:system-ui;max-width:400px;margin:80px auto;text-align:center;color:#555}h1{color:#222}</style></head><body><h1>Link already used</h1><p>This link has reached its download limit. Contact the sender to request a new one.</p></body></html>';
+          const R410=(b)=>({status:'410',statusDescription:'Gone',headers:{'content-type':[{key:'Content-Type',value:'text/html'}],'cache-control':[{key:'Cache-Control',value:'no-store'}]},body:b});
           exports.handler=async(event)=>{
-            const{request:q,response:r}=event.Records[0].cf;
-            if(r.status!=='200')return r;
+            const cf=event.Records[0].cf,q=cf.request,r=cf.response;
             const p=q.uri.replace(/^\/+/,'').split('/');
-            if(p.length<2||!/^\d{10}$/.test(p[0])||!/^[A-Za-z0-9]{8}$/.test(p[1]))return r;
+            if(!r){
+              if(p.length===1&&p[0]&&!/^\d{10}$/.test(p[0])){
+                try{
+                  const g=await kvsReq('GET',p[0]);
+                  if(g.s!==200)throw 0;
+                  return{status:'302',statusDescription:'Found',headers:{location:[{key:'Location',value:'/'+JSON.parse(g.b).Value}],'cache-control':[{key:'Cache-Control',value:'no-store'}]}};
+                }catch(e){return{status:'404',statusDescription:'Not Found',headers:{'content-type':[{key:'Content-Type',value:'text/plain'}]},body:'Not found'};}
+              }
+              if(p.length<2||!/^\d{10}$/.test(p[0]))return{status:'400',statusDescription:'Bad Request',headers:{'content-type':[{key:'Content-Type',value:'text/plain'}]},body:'Invalid link'};
+              if(Math.floor(Date.now()/1000)>parseInt(p[0],10))return R410(GONE_EXP);
+              try{const g=await kvsReq('GET','dl:'+p[1]);if(g.s===200&&parseInt(JSON.parse(g.b).Value,10)===0)return R410(GONE_DL);}catch(e){}
+              return q;
+            }
+            if(r.status!=='200'||p.length<2||!/^\d{10}$/.test(p[0])||!/^[A-Za-z0-9]{8}$/.test(p[1]))return r;
             try{
               const k='dl:'+p[1];
               const g=await kvsReq('GET',k);
@@ -257,10 +228,9 @@ Resources:
           AllowedMethods: [GET, HEAD]
           CachedMethods: [GET, HEAD]
           Compress: true
-          FunctionAssociations:
-            - EventType: viewer-request
-              FunctionARN: !GetAtt ExpiryCheckFunction.FunctionARN
           LambdaFunctionAssociations:
+            - EventType: viewer-request
+              LambdaFunctionARN: !Ref ViewerResponseVersion
             - EventType: viewer-response
               LambdaFunctionARN: !Ref ViewerResponseVersion
         HttpVersion: http2and3

@@ -216,6 +216,7 @@ for z in json.load(sys.stdin): print(z['id'].replace('/hostedzone/', ''))
             "HostedZoneId=$HOSTED_ZONE_ID" \
             "BucketName=$BUCKET_NAME" \
         --tags "tinyshare:managed=true" \
+        --capabilities CAPABILITY_IAM \
         --region us-east-1 \
         --no-fail-on-empty-changeset
 
