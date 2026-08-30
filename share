@@ -531,7 +531,7 @@ cmd_logs() {
         local _fname
         _fname=$(echo "$_line" | awk '{print $NF}')
         [[ "$_fname" =~ \.gz$ ]] && files+=("$_fname")
-    done < <(aws s3 ls "s3://${log_bucket}/cf/" --region us-east-1 2>/dev/null | tail -100)
+    done < <(aws s3 ls "s3://${log_bucket}/cf/" --recursive --region us-east-1 2>/dev/null | tail -100)
 
     if (( ${#files[@]} == 0 )); then
         echo "  No logs yet — CloudFront delivers logs within ~1 hour of first access."
@@ -601,7 +601,7 @@ cmd_stats() {
         local _fname
         _fname=$(echo "$_line" | awk '{print $NF}')
         [[ "$_fname" =~ \.gz$ ]] && files+=("$_fname")
-    done < <(aws s3 ls "s3://${log_bucket}/cf/" --region us-east-1 2>/dev/null | tail -744)
+    done < <(aws s3 ls "s3://${log_bucket}/cf/" --recursive --region us-east-1 2>/dev/null | tail -744)
 
     if (( ${#files[@]} == 0 )); then
         echo "  No logs yet — CloudFront delivers logs within ~1 hour of first access."
