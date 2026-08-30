@@ -462,32 +462,32 @@ cmd_list() {
     now=$(date +%s)
 
     echo ""
-    printf "  %-20s  %-10s  %-28s  %s\n" "EXPIRES" "TOKEN" "FILE" "STATUS"
-    printf "  %s\n" "──────────────────────────────────────────────────────────────────────"
+    printf "  %-8s  %-24s  %-20s  %s\n" "STATUS" "FILE" "EXPIRES" "URL"
+    printf "  %s\n" "──────────────────────────────────────────────────────────────────────────────────────────────────────────"
 
     local found=0
     while IFS= read -r line; do
-        local key expiry token filename status expiry_human
+        local key expiry token filename status expiry_human url
         key=$(echo "$line" | awk '{print $NF}')
         expiry=$(echo "$key" | cut -d/ -f1)
         token=$(echo "$key" | cut -d/ -f2)
         [[ "$expiry" =~ ^[0-9]{10}$ ]] || continue
+        [[ "$token" =~ ^[A-Za-z0-9]{8}$ ]] || continue
 
         filename=$(aws s3api head-object \
             --bucket "$TINYSHARE_BUCKET" --key "$key" \
             --region "$TINYSHARE_REGION" \
-            --query 'Metadata.filename' --output text 2>/dev/null || echo "")
+            --query 'Metadata.filename' --output text 2>/dev/null || true)
         [[ -z "$filename" || "$filename" == "None" ]] && filename="(unknown)"
 
-        if (( now > expiry )); then
-            status="${RED}expired${NC}"
-        else
-            status="${GREEN}active${NC}"
-        fi
+        url="https://${TINYSHARE_DOMAIN}/${key}"
         expiry_human=$(format_expiry "$expiry")
 
-        printf "  %-20s  %-10s  %-28s  " "$expiry_human" "$token" "$filename"
-        echo -e "$status"
+        if (( now > expiry )); then
+            printf "  ${RED}%-8s${NC}  %-24s  %-20s  %s\n" "expired" "${filename:0:24}" "$expiry_human" "$url"
+        else
+            printf "  ${GREEN}%-8s${NC}  %-24s  %-20s  %s\n" "active" "${filename:0:24}" "$expiry_human" "$url"
+        fi
         found=$(( found + 1 ))
     done < <(aws s3 ls "s3://${TINYSHARE_BUCKET}/" --recursive --region "$TINYSHARE_REGION" 2>/dev/null)
 
