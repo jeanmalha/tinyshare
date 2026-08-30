@@ -2,14 +2,15 @@
 # tinyshare — upload files to S3 and generate time-limited share URLs.
 #
 # Usage:
-#   share setup                 One-time AWS infrastructure setup (CloudFormation)
-#   share <file> [duration]     Upload and print a share URL
-#   share list                  List all shares
-#   share revoke <token>        Delete a share immediately
-#   share teardown              Destroy all AWS infrastructure
-#   share delete-config         Remove local config only (keeps AWS resources)
-#   share uninstall             Remove share from PATH
-#   share help                  Show this help
+#   share setup                        One-time AWS infrastructure setup (CloudFormation)
+#   share <file> [duration]            Upload and print a share URL
+#   share <file> [duration] --alias=NAME  Upload with a custom vanity alias
+#   share list                         List all shares
+#   share revoke <token|alias>         Delete a share immediately
+#   share teardown                     Destroy all AWS infrastructure
+#   share delete-config                Remove local config only (keeps AWS resources)
+#   share uninstall                    Remove share from PATH
+#   share help                         Show this help
 #
 # Duration: 1h, 6h, 24h (default), 7d, 30d  (max 30d)
 set -euo pipefail
@@ -217,7 +218,7 @@ for z in json.load(sys.stdin): print(z['id'].replace('/hostedzone/', ''))
         --no-fail-on-empty-changeset
 
     # ── Get stack outputs ─────────────────────────────────────────────────────
-    local OUTPUTS DIST_ID
+    local OUTPUTS DIST_ID KVS_ARN
     OUTPUTS=$(aws cloudformation describe-stacks \
         --stack-name "$STACK_NAME" \
         --region us-east-1 \
@@ -228,17 +229,23 @@ import sys, json
 o = {x['OutputKey']: x['OutputValue'] for x in json.load(sys.stdin)}
 print(o.get('DistributionId', ''))
 ")
+    KVS_ARN=$(echo "$OUTPUTS" | python3 -c "
+import sys, json
+o = {x['OutputKey']: x['OutputValue'] for x in json.load(sys.stdin)}
+print(o.get('KeyValueStoreArn', ''))
+")
 
     # ── Save config ───────────────────────────────────────────────────────────
     mkdir -p "$CONFIG_DIR"
-    cat > "$CONFIG_FILE" <<EOF
-TINYSHARE_BUCKET=$BUCKET_NAME
-TINYSHARE_DOMAIN=$DOMAIN
-TINYSHARE_REGION=us-east-1
-TINYSHARE_CF_DIST_ID=$DIST_ID
-TINYSHARE_CF_STACK=$STACK_NAME
-TINYSHARE_AWS_PROFILE=$PROFILE
-EOF
+    {
+        echo "TINYSHARE_BUCKET=$BUCKET_NAME"
+        echo "TINYSHARE_DOMAIN=$DOMAIN"
+        echo "TINYSHARE_REGION=us-east-1"
+        echo "TINYSHARE_CF_DIST_ID=$DIST_ID"
+        echo "TINYSHARE_CF_STACK=$STACK_NAME"
+        echo "TINYSHARE_AWS_PROFILE=$PROFILE"
+        [[ -n "$KVS_ARN" ]] && echo "TINYSHARE_KVS_ARN=$KVS_ARN"
+    } > "$CONFIG_FILE"
     chmod 600 "$CONFIG_FILE"
 
     echo ""
@@ -256,11 +263,12 @@ cmd_upload() {
     load_config
     local file="$1"
     shift
-    local duration="24h" QR=0
+    local duration="24h" QR=0 ALIAS=""
     for _arg in "$@"; do
         case "$_arg" in
-            --qr) QR=1 ;;
-            *)    duration="$_arg" ;;
+            --qr)       QR=1 ;;
+            --alias=*)  ALIAS="${_arg#--alias=}" ;;
+            *)          duration="$_arg" ;;
         esac
     done
 
@@ -282,13 +290,32 @@ cmd_upload() {
     else tier="30d"
     fi
 
+    # Validate alias before uploading
+    if [[ -n "$ALIAS" ]]; then
+        [[ "$ALIAS" =~ ^[a-zA-Z0-9-]{2,32}$ ]] \
+            || die "Alias must be 2–32 characters, letters/numbers/hyphens only"
+        if [[ -n "${TINYSHARE_KVS_ARN:-}" ]]; then
+            if aws cloudfront-keyvaluestore get-key \
+                    --kvs-arn "$TINYSHARE_KVS_ARN" --key "$ALIAS" \
+                    &>/dev/null; then
+                die "Alias '$ALIAS' is already taken"
+            fi
+        else
+            warn "TINYSHARE_KVS_ARN not set — alias will not be registered in KVS"
+        fi
+    fi
+
+    # Build metadata string
+    local metadata="filename=${filename}"
+    [[ -n "$ALIAS" ]] && metadata="${metadata},alias=${ALIAS}"
+
     info "Uploading $(du -sh "$file" | cut -f1) ..."
     local _upload_err
     if ! _upload_err=$(aws s3 cp "$file" "s3://${TINYSHARE_BUCKET}/${s3_key}" \
         --region "$TINYSHARE_REGION" \
         --content-type "$mime" \
         --content-disposition "attachment; filename=\"${filename}\"" \
-        --metadata "filename=${filename}" \
+        --metadata "$metadata" \
         --no-progress 2>&1); then
         die "Upload failed: $_upload_err"
     fi
@@ -299,11 +326,32 @@ cmd_upload() {
         --tagging "{\"TagSet\":[{\"Key\":\"expiry-tier\",\"Value\":\"${tier}\"}]}" \
         2>/dev/null || true
 
+    # Register alias in KVS
+    if [[ -n "$ALIAS" && -n "${TINYSHARE_KVS_ARN:-}" ]]; then
+        local kvs_etag
+        kvs_etag=$(aws cloudfront-keyvaluestore describe-key-value-store \
+            --kvs-arn "$TINYSHARE_KVS_ARN" \
+            --query 'ETag' --output text)
+        aws cloudfront-keyvaluestore put-key \
+            --kvs-arn "$TINYSHARE_KVS_ARN" \
+            --key "$ALIAS" \
+            --value "$s3_key" \
+            --if-match "$kvs_etag" > /dev/null
+    fi
+
     echo ""
     printf '  \033[1m%s\033[0m\n' "$url"
+    if [[ -n "$ALIAS" ]]; then
+        local alias_url="https://${TINYSHARE_DOMAIN}/${ALIAS}"
+        printf '  \033[1m%s\033[0m  (alias)\n' "$alias_url"
+    fi
     printf '  Expires: %s\n' "$(format_expiry "$expiry")"
     echo ""
-    copy_to_clipboard "$url"
+    if [[ -n "$ALIAS" ]]; then
+        copy_to_clipboard "https://${TINYSHARE_DOMAIN}/${ALIAS}"
+    else
+        copy_to_clipboard "$url"
+    fi
     (( QR )) && show_qr "$url"
     echo ""
 }
@@ -316,31 +364,42 @@ cmd_list() {
     now=$(date +%s)
 
     echo ""
-    printf "  %-8s  %-24s  %-20s  %s\n" "STATUS" "FILE" "EXPIRES" "URL"
-    printf "  %s\n" "──────────────────────────────────────────────────────────────────────────────────────────────────────────"
+    printf "  %-8s  %-24s  %-14s  %-20s  %s\n" "STATUS" "FILE" "ALIAS" "EXPIRES" "URL"
+    printf "  %s\n" "──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────"
 
     local found=0
     while IFS= read -r line; do
-        local key expiry token filename status expiry_human url
+        local key expiry token meta filename alias_val expiry_human url
         key=$(echo "$line" | awk '{print $NF}')
         expiry=$(echo "$key" | cut -d/ -f1)
         token=$(echo "$key" | cut -d/ -f2)
         [[ "$expiry" =~ ^[0-9]{10}$ ]] || continue
         [[ "$token" =~ ^[A-Za-z0-9]{8}$ ]] || continue
 
-        filename=$(aws s3api head-object \
+        meta=$(aws s3api head-object \
             --bucket "$TINYSHARE_BUCKET" --key "$key" \
             --region "$TINYSHARE_REGION" \
-            --query 'Metadata.filename' --output text 2>/dev/null || true)
+            --query 'Metadata' --output json 2>/dev/null || echo '{}')
+        filename=$(echo "$meta" | python3 -c "
+import sys, json
+m = json.load(sys.stdin) or {}
+print(m.get('filename', '') or '')
+" 2>/dev/null || true)
+        alias_val=$(echo "$meta" | python3 -c "
+import sys, json
+m = json.load(sys.stdin) or {}
+print(m.get('alias', '') or '')
+" 2>/dev/null || true)
         [[ -z "$filename" || "$filename" == "None" ]] && filename="(unknown)"
+        [[ "$alias_val" == "None" ]] && alias_val=""
 
         url="https://${TINYSHARE_DOMAIN}/${key}"
         expiry_human=$(format_expiry "$expiry")
 
         if (( now > expiry )); then
-            printf "  ${RED}%-8s${NC}  %-24s  %-20s  %s\n" "expired" "${filename:0:24}" "$expiry_human" "$url"
+            printf "  ${RED}%-8s${NC}  %-24s  %-14s  %-20s  %s\n" "expired" "${filename:0:24}" "${alias_val:0:14}" "$expiry_human" "$url"
         else
-            printf "  ${GREEN}%-8s${NC}  %-24s  %-20s  %s\n" "active" "${filename:0:24}" "$expiry_human" "$url"
+            printf "  ${GREEN}%-8s${NC}  %-24s  %-14s  %-20s  %s\n" "active" "${filename:0:24}" "${alias_val:0:14}" "$expiry_human" "$url"
         fi
         found=$(( found + 1 ))
     done < <(aws s3 ls "s3://${TINYSHARE_BUCKET}/" --recursive --region "$TINYSHARE_REGION" 2>/dev/null)
@@ -355,19 +414,57 @@ cmd_list() {
 
 cmd_revoke() {
     load_config
-    local token="${1:-}"
-    [[ -n "$token" ]] || die "Usage: share revoke <token>"
+    local arg="${1:-}"
+    [[ -n "$arg" ]] || die "Usage: share revoke <token|alias>"
 
     local key
-    key=$(aws s3 ls "s3://${TINYSHARE_BUCKET}/" --recursive --region "$TINYSHARE_REGION" \
-        | awk '{print $NF}' | grep "/${token}$" | head -1)
-    [[ -n "$key" ]] || die "Share not found: $token"
+    # If arg doesn't look like an 8-char token, treat it as an alias
+    if [[ ! "$arg" =~ ^[A-Za-z0-9]{8}$ ]] && [[ -n "${TINYSHARE_KVS_ARN:-}" ]]; then
+        local alias_key
+        alias_key=$(aws cloudfront-keyvaluestore get-key \
+            --kvs-arn "$TINYSHARE_KVS_ARN" --key "$arg" \
+            --query 'Value' --output text 2>/dev/null || true)
+        [[ -n "$alias_key" && "$alias_key" != "None" ]] || die "Alias not found: $arg"
+        key="$alias_key"
+    else
+        key=$(aws s3 ls "s3://${TINYSHARE_BUCKET}/" --recursive --region "$TINYSHARE_REGION" \
+            | awk '{print $NF}' | grep "/${arg}$" | head -1)
+        [[ -n "$key" ]] || die "Share not found: $arg"
+    fi
+
+    # Read alias from S3 metadata before deleting
+    local meta alias_val
+    meta=$(aws s3api head-object \
+        --bucket "$TINYSHARE_BUCKET" --key "$key" \
+        --region "$TINYSHARE_REGION" \
+        --query 'Metadata' --output json 2>/dev/null || echo '{}')
+    alias_val=$(echo "$meta" | python3 -c "
+import sys, json
+m = json.load(sys.stdin) or {}
+print(m.get('alias', '') or '')
+" 2>/dev/null || true)
+    [[ "$alias_val" == "None" ]] && alias_val=""
 
     aws s3 rm "s3://${TINYSHARE_BUCKET}/${key}" --region "$TINYSHARE_REGION" > /dev/null
     aws cloudfront create-invalidation \
         --distribution-id "$TINYSHARE_CF_DIST_ID" \
         --paths "/${key}" > /dev/null
-    info "Revoked: $token"
+
+    # Clean up KVS alias entry if present
+    if [[ -n "$alias_val" && -n "${TINYSHARE_KVS_ARN:-}" ]]; then
+        local kvs_etag
+        kvs_etag=$(aws cloudfront-keyvaluestore describe-key-value-store \
+            --kvs-arn "$TINYSHARE_KVS_ARN" \
+            --query 'ETag' --output text 2>/dev/null || true)
+        if [[ -n "$kvs_etag" && "$kvs_etag" != "None" ]]; then
+            aws cloudfront-keyvaluestore delete-key \
+                --kvs-arn "$TINYSHARE_KVS_ARN" \
+                --key "$alias_val" \
+                --if-match "$kvs_etag" > /dev/null 2>/dev/null || true
+        fi
+    fi
+
+    info "Revoked: $arg"
 }
 
 # ── logs ──────────────────────────────────────────────────────────────────────
@@ -845,7 +942,7 @@ for s in data.get('Stacks', []):
     fi
 
     # ── Extract outputs ───────────────────────────────────────────────────────
-    local OUTPUTS BUCKET DIST_ID
+    local OUTPUTS BUCKET DIST_ID KVS_ARN
     OUTPUTS=$(aws cloudformation describe-stacks \
         --stack-name "$STACK_NAME" \
         --region us-east-1 \
@@ -861,20 +958,26 @@ import sys, json
 o = {x['OutputKey']: x['OutputValue'] for x in json.load(sys.stdin)}
 print(o.get('DistributionId', ''))
 ")
+    KVS_ARN=$(echo "$OUTPUTS" | python3 -c "
+import sys, json
+o = {x['OutputKey']: x['OutputValue'] for x in json.load(sys.stdin)}
+print(o.get('KeyValueStoreArn', ''))
+")
 
     [[ -n "$BUCKET" && -n "$DIST_ID" && -n "$DOMAIN" ]] \
         || die "Could not read stack outputs — stack may still be deploying"
 
     # ── Write config ──────────────────────────────────────────────────────────
     mkdir -p "$CONFIG_DIR"
-    cat > "$CONFIG_FILE" <<EOF
-TINYSHARE_BUCKET=$BUCKET
-TINYSHARE_DOMAIN=$DOMAIN
-TINYSHARE_REGION=us-east-1
-TINYSHARE_CF_DIST_ID=$DIST_ID
-TINYSHARE_CF_STACK=$STACK_NAME
-TINYSHARE_AWS_PROFILE=$PROFILE
-EOF
+    {
+        echo "TINYSHARE_BUCKET=$BUCKET"
+        echo "TINYSHARE_DOMAIN=$DOMAIN"
+        echo "TINYSHARE_REGION=us-east-1"
+        echo "TINYSHARE_CF_DIST_ID=$DIST_ID"
+        echo "TINYSHARE_CF_STACK=$STACK_NAME"
+        echo "TINYSHARE_AWS_PROFILE=$PROFILE"
+        [[ -n "$KVS_ARN" ]] && echo "TINYSHARE_KVS_ARN=$KVS_ARN"
+    } > "$CONFIG_FILE"
     chmod 600 "$CONFIG_FILE"
 
     echo ""
@@ -892,19 +995,20 @@ cmd_help() {
   ${BOLD}tinyshare${NC} — create time-limited file share links via S3 + CloudFront
 
   ${BOLD}USAGE${NC}
-    share setup                  One-time AWS setup via CloudFormation
-    share connect                Import config from an existing deployment
-    share <file> [duration]      Upload file and print a share URL
-    share <file> [duration] --qr Upload and also display a QR code
-    share qr <token|url>         Display QR code for an existing share
-    share list                   List all shares and their status
-    share revoke <token>         Delete a share immediately
-    share logs [token]           Show raw access log rows
-    share stats [token]          Aggregate stats: hits, IPs, browsers, edges
-    share teardown               Destroy all AWS infrastructure
-    share delete-config          Remove local config (keeps AWS resources)
-    share uninstall              Remove share from PATH
-    share help                   Show this help
+    share setup                          One-time AWS setup via CloudFormation
+    share connect                        Import config from an existing deployment
+    share <file> [duration]              Upload file and print a share URL
+    share <file> [duration] --qr         Upload and also display a QR code
+    share <file> [duration] --alias=NAME Upload with a custom vanity alias
+    share qr <token|url>                 Display QR code for an existing share
+    share list                           List all shares and their status
+    share revoke <token|alias>           Delete a share immediately
+    share logs [token]                   Show raw access log rows
+    share stats [token]                  Aggregate stats: hits, IPs, browsers, edges
+    share teardown                       Destroy all AWS infrastructure
+    share delete-config                  Remove local config (keeps AWS resources)
+    share uninstall                      Remove share from PATH
+    share help                           Show this help
 
   ${BOLD}DURATION${NC}
     1h  6h  24h (default)  7d  30d
@@ -913,10 +1017,12 @@ cmd_help() {
     share report.pdf             Share for 24 hours
     share photo.jpg 7d           Share for 7 days
     share photo.jpg 7d --qr      Share and show QR code
+    share photo.jpg 7d --alias=oreo  Share with alias → https://domain/oreo
     share archive.zip 1h         Share for 1 hour
     share qr aB3xKm9P            Show QR for an existing share
     share list                   Show all shares
     share revoke aB3xKm9P        Immediately delete a share
+    share revoke oreo            Immediately delete a share by alias
 
   ${BOLD}CONFIG${NC}
     $CONFIG_FILE
