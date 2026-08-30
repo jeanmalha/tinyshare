@@ -5,6 +5,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INSTALL_DIR="$HOME/.local/bin"
 TARGET="$INSTALL_DIR/share"
+DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/tinyshare"
+TEMPLATE_TARGET="$DATA_DIR/template.yaml"
 
 GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BOLD='\033[1m'; NC='\033[0m'
 info() { echo -e "${GREEN}▶${NC} $*"; }
@@ -12,10 +14,12 @@ warn() { echo -e "${YELLOW}⚠${NC}  $*"; }
 
 # ── Install ───────────────────────────────────────────────────────────────────
 
-mkdir -p "$INSTALL_DIR"
+mkdir -p "$INSTALL_DIR" "$DATA_DIR"
 cp "$SCRIPT_DIR/share" "$TARGET"
 chmod +x "$TARGET"
+cp "$SCRIPT_DIR/template.yaml" "$TEMPLATE_TARGET"
 info "Installed: $TARGET"
+info "Installed: $TEMPLATE_TARGET"
 
 # ── PATH check ────────────────────────────────────────────────────────────────
 

@@ -88,190 +88,15 @@ copy_to_clipboard() {
     fi
 }
 
-# Writes the CloudFormation template to $1.
-# Single-quoted heredoc — no bash variable expansion; ${ } are CloudFormation syntax.
-write_cf_template() {
-    cat > "$1" <<'CFTEMPLATE'
-AWSTemplateFormatVersion: '2010-09-09'
-Description: tinyshare — time-limited file sharing via S3 + CloudFront
-
-Parameters:
-  Domain:
-    Type: String
-    Description: Full subdomain for sharing (e.g. share.example.com)
-  HostedZoneId:
-    Type: String
-    Description: Route 53 hosted zone ID
-  BucketName:
-    Type: String
-    Description: S3 bucket name for shared files
-
-Resources:
-
-  ShareBucket:
-    Type: AWS::S3::Bucket
-    DeletionPolicy: Delete
-    Properties:
-      BucketName: !Ref BucketName
-      PublicAccessBlockConfiguration:
-        BlockPublicAcls: true
-        IgnorePublicAcls: true
-        BlockPublicPolicy: true
-        RestrictPublicBuckets: true
-      LifecycleConfiguration:
-        Rules:
-          - Id: expire-tier-1d
-            Status: Enabled
-            TagFilters:
-              - Key: expiry-tier
-                Value: 1d
-            ExpirationInDays: 2
-          - Id: expire-tier-7d
-            Status: Enabled
-            TagFilters:
-              - Key: expiry-tier
-                Value: 7d
-            ExpirationInDays: 8
-          - Id: expire-tier-30d
-            Status: Enabled
-            TagFilters:
-              - Key: expiry-tier
-                Value: 30d
-            ExpirationInDays: 31
-          - Id: expire-shares-fallback
-            Status: Enabled
-            ExpirationInDays: 35
-
-  BucketPolicy:
-    Type: AWS::S3::BucketPolicy
-    Properties:
-      Bucket: !Ref ShareBucket
-      PolicyDocument:
-        Version: '2012-10-17'
-        Statement:
-          - Effect: Allow
-            Principal:
-              Service: cloudfront.amazonaws.com
-            Action: s3:GetObject
-            Resource: !Sub 'arn:aws:s3:::${ShareBucket}/*'
-            Condition:
-              StringEquals:
-                AWS:SourceArn: !Sub 'arn:aws:cloudfront::${AWS::AccountId}:distribution/${Distribution}'
-
-  LogBucket:
-    Type: AWS::S3::Bucket
-    DeletionPolicy: Retain
-    Properties:
-      BucketName: !Sub '${BucketName}-logs'
-      OwnershipControls:
-        Rules:
-          - ObjectOwnership: BucketOwnerPreferred
-      PublicAccessBlockConfiguration:
-        BlockPublicAcls: true
-        IgnorePublicAcls: true
-        BlockPublicPolicy: true
-        RestrictPublicBuckets: true
-      LifecycleConfiguration:
-        Rules:
-          - Id: expire-logs
-            Status: Enabled
-            ExpirationInDays: 90
-
-  OriginAccessControl:
-    Type: AWS::CloudFront::OriginAccessControl
-    Properties:
-      OriginAccessControlConfig:
-        Name: !Sub '${AWS::StackName}-oac'
-        OriginAccessControlOriginType: s3
-        SigningBehavior: always
-        SigningProtocol: sigv4
-
-  ExpiryCheckFunction:
-    Type: AWS::CloudFront::Function
-    Properties:
-      Name: !Sub '${AWS::StackName}-expiry-check'
-      AutoPublish: true
-      FunctionConfig:
-        Comment: Validates share link expiry
-        Runtime: cloudfront-js-2.0
-      FunctionCode: |
-        function handler(event) {
-            var uri = event.request.uri;
-            var parts = uri.replace(/^\/+/, '').split('/');
-            if (parts.length < 2 || !/^\d{10}$/.test(parts[0])) {
-                return { statusCode: 400, statusDescription: 'Bad Request', headers: { 'content-type': { value: 'text/plain' } }, body: 'Invalid link' };
-            }
-            if (Math.floor(Date.now() / 1000) > parseInt(parts[0], 10)) {
-                return { statusCode: 410, statusDescription: 'Gone', headers: { 'content-type': { value: 'text/html' }, 'cache-control': { value: 'no-store' } }, body: '<!DOCTYPE html><html><head><title>Expired</title><style>body{font-family:system-ui;max-width:400px;margin:80px auto;text-align:center;color:#555}h1{color:#222}</style></head><body><h1>Link expired</h1><p>This share link is no longer valid.</p></body></html>' };
-            }
-            return event.request;
-        }
-
-  Certificate:
-    Type: AWS::CertificateManager::Certificate
-    Properties:
-      DomainName: !Ref Domain
-      ValidationMethod: DNS
-      DomainValidationOptions:
-        - DomainName: !Ref Domain
-          HostedZoneId: !Ref HostedZoneId
-
-  Distribution:
-    Type: AWS::CloudFront::Distribution
-    Properties:
-      DistributionConfig:
-        Enabled: true
-        Comment: tinyshare
-        Aliases:
-          - !Ref Domain
-        Origins:
-          - Id: s3-tinyshare
-            DomainName: !Sub '${BucketName}.s3.${AWS::Region}.amazonaws.com'
-            S3OriginConfig:
-              OriginAccessIdentity: ''
-            OriginAccessControlId: !GetAtt OriginAccessControl.Id
-        DefaultCacheBehavior:
-          TargetOriginId: s3-tinyshare
-          ViewerProtocolPolicy: redirect-to-https
-          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
-          AllowedMethods: [GET, HEAD]
-          CachedMethods: [GET, HEAD]
-          Compress: true
-          FunctionAssociations:
-            - EventType: viewer-request
-              FunctionARN: !GetAtt ExpiryCheckFunction.FunctionARN
-        HttpVersion: http2and3
-        IPV6Enabled: true
-        Logging:
-          Bucket: !GetAtt LogBucket.DomainName
-          Prefix: 'cf/'
-          IncludeCookies: false
-        ViewerCertificate:
-          AcmCertificateArn: !Ref Certificate
-          SslSupportMethod: sni-only
-          MinimumProtocolVersion: TLSv1.2_2021
-
-  DnsRecord:
-    Type: AWS::Route53::RecordSet
-    Properties:
-      HostedZoneId: !Ref HostedZoneId
-      Name: !Ref Domain
-      Type: A
-      AliasTarget:
-        DNSName: !GetAtt Distribution.DomainName
-        HostedZoneId: Z2FDTNDATAQYW2
-        EvaluateTargetHealth: false
-
-Outputs:
-  BucketName:
-    Value: !Ref ShareBucket
-  LogBucketName:
-    Value: !Ref LogBucket
-  DistributionId:
-    Value: !Ref Distribution
-  ShareUrl:
-    Value: !Sub 'https://${Domain}'
-CFTEMPLATE
+find_template() {
+    local data_dir="${XDG_DATA_HOME:-$HOME/.local/share}/tinyshare"
+    if [[ -f "$data_dir/template.yaml" ]]; then
+        echo "$data_dir/template.yaml"
+    elif [[ -f "$(dirname "$0")/../share/tinyshare/template.yaml" ]]; then
+        echo "$(dirname "$0")/../share/tinyshare/template.yaml"
+    else
+        die "template.yaml not found — re-run install.sh to restore it"
+    fi
 }
 
 # ── setup ─────────────────────────────────────────────────────────────────────
@@ -371,8 +196,7 @@ for z in json.load(sys.stdin): print(z['id'].replace('/hostedzone/', ''))
 
     # ── Deploy CloudFormation stack ───────────────────────────────────────────
     local CF_TEMPLATE
-    CF_TEMPLATE=$(mktemp /tmp/tinyshare-cf.XXXXXX.yaml)
-    write_cf_template "$CF_TEMPLATE"
+    CF_TEMPLATE=$(find_template)
 
     info "Deploying CloudFormation stack..."
     info "(ACM validation + CloudFront deployment takes ~10 minutes)"
@@ -386,7 +210,6 @@ for z in json.load(sys.stdin): print(z['id'].replace('/hostedzone/', ''))
             "BucketName=$BUCKET_NAME" \
         --region us-east-1 \
         --no-fail-on-empty-changeset
-    rm -f "$CF_TEMPLATE"
 
     # ── Get stack outputs ─────────────────────────────────────────────────────
     local OUTPUTS DIST_ID
