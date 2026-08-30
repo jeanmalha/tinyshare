@@ -541,13 +541,28 @@ cmd_logs() {
     fi
 
     [[ -n "$filter" ]] && info "Filtering for: $filter" && echo ""
-    printf "  %-19s  %-15s  %-6s  %-14s  %-42s  %s\n" \
-        "DATE/TIME (UTC)" "IP" "STATUS" "EDGE" "USER AGENT" "PATH"
+    printf "  %-19s  %-15s  %-6s  %-14s  %-24s  %-32s  %s\n" \
+        "DATE/TIME (UTC)" "IP" "STATUS" "EDGE" "FILE" "USER AGENT" "TOKEN"
     printf "  %s\n" \
         "──────────────────────────────────────────────────────────────────────────────────────────────────────────"
 
     local tmp_dir found=0
     tmp_dir=$(mktemp -d /tmp/tinyshare-logs.XXXXXX)
+
+    # Build token→filename map from S3 object metadata
+    local _map="${tmp_dir}/_names.tsv"
+    touch "$_map"
+    while IFS= read -r _key; do
+        local _tok _fn
+        _tok="${_key##*/}"
+        _fn=$(aws s3api head-object \
+            --bucket "$TINYSHARE_BUCKET" --key "$_key" \
+            --region "$TINYSHARE_REGION" \
+            --query 'Metadata.filename' --output text 2>/dev/null || true)
+        [[ -n "$_fn" && "$_fn" != "None" ]] && printf '%s\t%s\n' "$_tok" "$_fn" >> "$_map"
+    done < <(aws s3 ls "s3://${TINYSHARE_BUCKET}/" --recursive \
+        --region "$TINYSHARE_REGION" 2>/dev/null | \
+        awk '{print $NF}' | grep -E '^[0-9]{10}/[A-Za-z0-9]{8}$'; true)
 
     for _fname in "${files[@]}"; do
         local _local="${tmp_dir}/${_fname##*/}"
@@ -559,8 +574,13 @@ cmd_logs() {
             found=$(( found + 1 ))
         done < <(python3 -c "
 import sys, gzip, urllib.parse, re
-logfile, filt = sys.argv[1], sys.argv[2]
-share_re = re.compile(r'^/\d{10}/\S+')
+logfile, filt, map_file = sys.argv[1], sys.argv[2], sys.argv[3]
+names = {}
+with open(map_file) as mf:
+    for ln in mf:
+        parts = ln.rstrip('\n').split('\t', 1)
+        if len(parts) == 2: names[parts[0]] = parts[1]
+share_re = re.compile(r'^/\d{10}/([A-Za-z0-9]{8})')
 try:
     with gzip.open(logfile, 'rt', errors='replace') as f:
         for line in f:
@@ -569,13 +589,16 @@ try:
             if len(p) < 11: continue
             date, time, edge, ip = p[0], p[1][:8], p[2], p[4]
             uri, status, ua = p[7], p[8], p[10]
-            if not share_re.match(uri): continue
+            m = share_re.match(uri)
+            if not m: continue
+            token = m.group(1)
             if filt and filt not in uri: continue
-            ua = urllib.parse.unquote(ua)[:42]
-            print(f'  {date} {time}  {ip:<15}  {status:<6}  {edge:<14}  {ua:<42}  {uri}')
+            ua = urllib.parse.unquote(ua)[:32]
+            fname = names.get(token, '')[:24]
+            print(f'  {date} {time}  {ip:<15}  {status:<6}  {edge:<14}  {fname:<24}  {ua:<32}  {token}')
 except Exception:
     pass
-" "$_local" "$filter" 2>/dev/null || true)
+" "$_local" "$filter" "$_map" 2>/dev/null || true)
     done
 
     rm -rf "$tmp_dir"
@@ -624,11 +647,31 @@ cmd_stats() {
             --region us-east-1 --quiet 2>/dev/null || true
     done
 
-    python3 - "$tmp_dir" "$filter" <<'PYEOF'
+    # Build token→filename map from S3 object metadata
+    local _map="${tmp_dir}/_names.tsv"
+    touch "$_map"
+    while IFS= read -r _key; do
+        local _tok _fn
+        _tok="${_key##*/}"
+        _fn=$(aws s3api head-object \
+            --bucket "$TINYSHARE_BUCKET" --key "$_key" \
+            --region "$TINYSHARE_REGION" \
+            --query 'Metadata.filename' --output text 2>/dev/null || true)
+        [[ -n "$_fn" && "$_fn" != "None" ]] && printf '%s\t%s\n' "$_tok" "$_fn" >> "$_map"
+    done < <(aws s3 ls "s3://${TINYSHARE_BUCKET}/" --recursive \
+        --region "$TINYSHARE_REGION" 2>/dev/null | \
+        awk '{print $NF}' | grep -E '^[0-9]{10}/[A-Za-z0-9]{8}$'; true)
+
+    python3 - "$tmp_dir" "$filter" "$_map" <<'PYEOF'
 import sys, gzip, os, urllib.parse
 from collections import defaultdict, Counter
 
-tmp_dir, filt = sys.argv[1], sys.argv[2]
+tmp_dir, filt, map_file = sys.argv[1], sys.argv[2], sys.argv[3]
+names = {}
+with open(map_file) as mf:
+    for ln in mf:
+        parts = ln.rstrip('\n').split('\t', 1)
+        if len(parts) == 2: names[parts[0]] = parts[1]
 
 hits   = defaultdict(int)
 uniq   = defaultdict(set)
@@ -696,10 +739,11 @@ print(f'  Unique IPs     : {total_ips}')
 print(f'  Unique tokens  : {len(hits)}')
 
 print()
-print(f'  {"TOKEN":<10}  {"HITS":>5}  {"UNIQ IPs":>8}  {"FIRST ACCESS":<19}  LAST ACCESS')
+print(f'  {"TOKEN":<10}  {"FILE":<28}  {"HITS":>5}  {"UNIQ IPs":>8}  {"FIRST ACCESS":<19}  LAST ACCESS')
 rule()
 for token, h in sorted(hits.items(), key=lambda x: -x[1]):
-    print(f'  {token:<10}  {h:>5}  {len(uniq[token]):>8}  {first[token]:<19}  {last[token]}')
+    fname = names.get(token, '')[:28]
+    print(f'  {token:<10}  {fname:<28}  {h:>5}  {len(uniq[token]):>8}  {first[token]:<19}  {last[token]}')
 
 STATUS_LABEL = {
     '200': 'OK', '204': 'No Content', '206': 'Partial', '304': 'Not Modified',
