@@ -558,8 +558,9 @@ cmd_logs() {
             printf '%s\n' "$_row"
             found=$(( found + 1 ))
         done < <(python3 -c "
-import sys, gzip, urllib.parse
+import sys, gzip, urllib.parse, re
 logfile, filt = sys.argv[1], sys.argv[2]
+share_re = re.compile(r'^/\d{10}/\S+')
 try:
     with gzip.open(logfile, 'rt', errors='replace') as f:
         for line in f:
@@ -568,6 +569,7 @@ try:
             if len(p) < 11: continue
             date, time, edge, ip = p[0], p[1][:8], p[2], p[4]
             uri, status, ua = p[7], p[8], p[10]
+            if not share_re.match(uri): continue
             if filt and filt not in uri: continue
             ua = urllib.parse.unquote(ua)[:42]
             print(f'  {date} {time}  {ip:<15}  {status:<6}  {edge:<14}  {ua:<42}  {uri}')
