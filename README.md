@@ -28,6 +28,7 @@ Everything runs on AWS free tier / pay-as-you-go. No Lambda, no DynamoDB, no run
 - A domain managed in Route 53
 - `python3` (comes with macOS / most Linux distros)
 - `bash` 3.2+ (the macOS default is fine)
+- `qrencode` *(optional)* — for QR code output (`brew install qrencode`)
 
 ## Install
 
@@ -66,7 +67,15 @@ share report.pdf 7d
 share archive.zip 1h
 share data.csv 30d
 
-# List all shares and their status
+# Upload and display a QR code
+share photo.jpg --qr
+share report.pdf 7d --qr
+
+# Display a QR code for an existing share
+share qr aB3xKm9P
+share qr https://s.yourdomain.com/1754000000/aB3xKm9P
+
+# List all shares with status and URL
 share list
 
 # Delete a share immediately
@@ -83,9 +92,32 @@ share stats aB3xKm9P  # drill into one token
 
 **Durations:** `1h` `6h` `24h` (default) `7d` `30d`
 
+## QR codes
+
+Add `--qr` to any upload to print a QR code directly in the terminal — useful for sharing to a phone without copy-pasting:
+
+```
+share photo.jpg 7d --qr
+▶ Uploading 1.4M ...
+
+  https://s.yourdomain.com/1754000000/aB3xKm9P
+  Expires: 2026-09-05 14:32 UTC
+
+  ↗ Copied to clipboard
+
+  █████████████████████████████████
+  █████████████████████████████████
+  ████ ▄▄▄▄▄ █▀▄ ▀▄▄▄▀█ ▄▄▄▄▄ ████
+  ...
+```
+
+You can also generate a QR for an existing share: `share qr <token>`.
+
+Requires `qrencode` — if it's not installed, the command prints install instructions and continues.
+
 ## Access logs & stats
 
-CloudFront delivers access logs to a dedicated S3 bucket within ~1 hour of each request. `share logs` and `share stats` download and parse them locally — no dashboard, no third-party analytics.
+CloudFront delivers access logs to a dedicated S3 bucket within ~1 hour of each request. `share logs` and `share stats` download and parse them locally — no dashboard, no third-party analytics. Bot traffic and requests to non-share paths are filtered out automatically.
 
 ```
 $ share stats
@@ -94,10 +126,10 @@ $ share stats
   Unique IPs     : 3
   Unique tokens  : 2
 
-  TOKEN       HITS  UNIQ IPs  FIRST ACCESS         LAST ACCESS
-  ────────────────────────────────────────────────────────────────────────────────
-  aB3xKm9P      11         2  2026-08-29 14:03:11  2026-08-30 09:17:44
-  kR7pQmNs       3         1  2026-08-30 07:55:02  2026-08-30 07:55:04
+  TOKEN       FILE                          HITS  UNIQ IPs  FIRST ACCESS         LAST ACCESS
+  ──────────────────────────────────────────────────────────────────────────────────────────
+  aB3xKm9P  report.pdf                      11         2  2026-08-29 14:03:11  2026-08-30 09:17:44
+  kR7pQmNs  photo.jpg                        3         1  2026-08-30 07:55:02  2026-08-30 07:55:04
 
   HTTP statuses:
     200  OK                      13
@@ -114,7 +146,7 @@ $ share stats
     curl / Unknown                 2
 ```
 
-Each row in `share logs` shows: date/time (UTC), client IP, HTTP status, CloudFront edge location (e.g. `CDG` = Paris, `JFK` = New York), user agent, and path.
+Each row in `share logs` shows: date/time (UTC), client IP, HTTP status, CloudFront edge location (e.g. `CDG` = Paris, `JFK` = New York), original filename, user agent, and token.
 
 ## Teardown
 
@@ -143,7 +175,7 @@ Sharing a 10 MB file 100 times costs less than $0.01.
 
 All resources are deployed as a single CloudFormation stack in `us-east-1`:
 
-- `AWS::S3::Bucket` — private file storage with tiered lifecycle rules
+- `AWS::S3::Bucket` — private file storage with tiered lifecycle rules (1d, 7d, 30d, 35d catch-all)
 - `AWS::S3::BucketPolicy` — allows CloudFront OAC access only
 - `AWS::CloudFront::OriginAccessControl` — signs requests from CloudFront to S3
 - `AWS::CloudFront::Function` — validates expiry on every viewer request (viewer-request event, before cache)
