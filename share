@@ -109,9 +109,21 @@ Resources:
         RestrictPublicBuckets: true
       LifecycleConfiguration:
         Rules:
-          - Id: expire-shares
+          - Id: expire-shares-fallback
             Status: Enabled
             ExpirationInDays: 31
+          - Id: expire-tier-1d
+            Status: Enabled
+            TagFilters:
+              - Key: expiry-tier
+                Value: 1d
+            ExpirationInDays: 2
+          - Id: expire-tier-7d
+            Status: Enabled
+            TagFilters:
+              - Key: expiry-tier
+                Value: 7d
+            ExpirationInDays: 8
 
   BucketPolicy:
     Type: AWS::S3::BucketPolicy
@@ -401,7 +413,7 @@ cmd_upload() {
 
     [[ -f "$file" ]] || die "File not found: $file"
 
-    local seconds expiry token mime filename s3_key url
+    local seconds expiry token mime filename s3_key url tier
     seconds=$(parse_duration "$duration")
     (( seconds <= 2592000 )) || die "Maximum duration is 30d"
 
@@ -412,6 +424,11 @@ cmd_upload() {
     s3_key="${expiry}/${token}"
     url="https://${TINYSHARE_DOMAIN}/${expiry}/${token}"
 
+    if (( seconds <= 86400 )); then tier="1d"
+    elif (( seconds <= 604800 )); then tier="7d"
+    else tier="30d"
+    fi
+
     info "Uploading $(du -sh "$file" | cut -f1) ..."
     local _upload_err
     if ! _upload_err=$(aws s3 cp "$file" "s3://${TINYSHARE_BUCKET}/${s3_key}" \
@@ -419,6 +436,7 @@ cmd_upload() {
         --content-type "$mime" \
         --content-disposition "attachment; filename=\"${filename}\"" \
         --metadata "filename=${filename}" \
+        --tagging "expiry-tier=${tier}" \
         --no-progress 2>&1); then
         die "Upload failed: $_upload_err"
     fi
