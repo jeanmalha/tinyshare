@@ -1,0 +1,859 @@
+#!/usr/bin/env bash
+# tinyshare — upload files to S3 and generate time-limited share URLs.
+#
+# Usage:
+#   share setup                 One-time AWS infrastructure setup (CloudFormation)
+#   share <file> [duration]     Upload and print a share URL
+#   share list                  List all shares
+#   share revoke <token>        Delete a share immediately
+#   share teardown              Destroy all AWS infrastructure
+#   share delete-config         Remove local config only (keeps AWS resources)
+#   share uninstall             Remove share from PATH
+#   share help                  Show this help
+#
+# Duration: 1h, 6h, 24h (default), 7d, 30d  (max 30d)
+set -euo pipefail
+
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/tinyshare"
+CONFIG_FILE="$CONFIG_DIR/config.env"
+
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BOLD='\033[1m'; NC='\033[0m'
+info()    { echo -e "${GREEN}▶${NC} $*"; }
+warn()    { echo -e "${YELLOW}⚠${NC}  $*"; }
+die()     { printf '\nError: %s\n\n' "$*"; exit 1; }
+confirm() { read -r -p "$1 [y/N] " _ans; [[ "$_ans" =~ ^[Yy]$ ]]; }
+
+trap 'printf "\nError: unexpected failure on line %s\n\n" "$LINENO"' ERR
+
+load_config() {
+    [[ -f "$CONFIG_FILE" ]] || die "Not configured — run: share setup"
+    # shellcheck source=/dev/null
+    source "$CONFIG_FILE"
+    [[ -n "${TINYSHARE_AWS_PROFILE:-}" ]] && export AWS_PROFILE="$TINYSHARE_AWS_PROFILE"
+}
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+parse_duration() {
+    local dur="${1:-24h}"
+    if [[ "$dur" =~ ^([0-9]+)([hHdDmM])$ ]]; then
+        local num="${BASH_REMATCH[1]}" unit
+        unit=$(echo "${BASH_REMATCH[2]}" | tr '[:upper:]' '[:lower:]')
+        case "$unit" in
+            m) echo $(( num * 60 )) ;;
+            h) echo $(( num * 3600 )) ;;
+            d) echo $(( num * 86400 )) ;;
+        esac
+    else
+        die "Invalid duration '$dur'. Use e.g.: 1h, 24h, 7d"
+    fi
+}
+
+random_token() {
+    LC_ALL=C tr -dc 'a-zA-Z0-9' < /dev/urandom | head -c 8 || true
+}
+
+guess_mime() {
+    python3 -c "
+import mimetypes, sys
+t, _ = mimetypes.guess_type(sys.argv[1])
+print(t or 'application/octet-stream')
+" "$1"
+}
+
+format_expiry() {
+    date -r "$1" '+%Y-%m-%d %H:%M UTC' 2>/dev/null \
+        || date -d "@$1" '+%Y-%m-%d %H:%M UTC' 2>/dev/null \
+        || echo "(expires: $1)"
+}
+
+copy_to_clipboard() {
+    if command -v pbcopy &>/dev/null; then
+        echo -n "$1" | pbcopy 2>/dev/null \
+            && echo -e "  ${YELLOW}↗${NC} Copied to clipboard" || true
+    elif command -v xclip &>/dev/null; then
+        echo -n "$1" | xclip -selection clipboard 2>/dev/null \
+            && echo -e "  ${YELLOW}↗${NC} Copied to clipboard" || true
+    fi
+}
+
+# Writes the CloudFormation template to $1.
+# Single-quoted heredoc — no bash variable expansion; ${ } are CloudFormation syntax.
+write_cf_template() {
+    cat > "$1" <<'CFTEMPLATE'
+AWSTemplateFormatVersion: '2010-09-09'
+Description: tinyshare — time-limited file sharing via S3 + CloudFront
+
+Parameters:
+  Domain:
+    Type: String
+    Description: Full subdomain for sharing (e.g. share.example.com)
+  HostedZoneId:
+    Type: String
+    Description: Route 53 hosted zone ID
+  BucketName:
+    Type: String
+    Description: S3 bucket name for shared files
+
+Resources:
+
+  ShareBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    Properties:
+      BucketName: !Ref BucketName
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        IgnorePublicAcls: true
+        BlockPublicPolicy: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-shares
+            Status: Enabled
+            ExpirationInDays: 31
+
+  BucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ShareBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub 'arn:aws:s3:::${ShareBucket}/*'
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub 'arn:aws:cloudfront::${AWS::AccountId}:distribution/${Distribution}'
+
+  LogBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    Properties:
+      BucketName: !Sub '${BucketName}-logs'
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerPreferred
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        IgnorePublicAcls: true
+        BlockPublicPolicy: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-logs
+            Status: Enabled
+            ExpirationInDays: 90
+
+  OriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub '${AWS::StackName}-oac'
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  ExpiryCheckFunction:
+    Type: AWS::CloudFront::Function
+    Properties:
+      Name: !Sub '${AWS::StackName}-expiry-check'
+      AutoPublish: true
+      FunctionConfig:
+        Comment: Validates share link expiry
+        Runtime: cloudfront-js-2.0
+      FunctionCode: |
+        function handler(event) {
+            var uri = event.request.uri;
+            var parts = uri.replace(/^\/+/, '').split('/');
+            if (parts.length < 2 || !/^\d{10}$/.test(parts[0])) {
+                return { statusCode: 400, statusDescription: 'Bad Request', headers: { 'content-type': { value: 'text/plain' } }, body: 'Invalid link' };
+            }
+            if (Math.floor(Date.now() / 1000) > parseInt(parts[0], 10)) {
+                return { statusCode: 410, statusDescription: 'Gone', headers: { 'content-type': { value: 'text/html' }, 'cache-control': { value: 'no-store' } }, body: '<!DOCTYPE html><html><head><title>Expired</title><style>body{font-family:system-ui;max-width:400px;margin:80px auto;text-align:center;color:#555}h1{color:#222}</style></head><body><h1>Link expired</h1><p>This share link is no longer valid.</p></body></html>' };
+            }
+            return event.request;
+        }
+
+  Certificate:
+    Type: AWS::CertificateManager::Certificate
+    Properties:
+      DomainName: !Ref Domain
+      ValidationMethod: DNS
+      DomainValidationOptions:
+        - DomainName: !Ref Domain
+          HostedZoneId: !Ref HostedZoneId
+
+  Distribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: tinyshare
+        Aliases:
+          - !Ref Domain
+        Origins:
+          - Id: s3-tinyshare
+            DomainName: !Sub '${BucketName}.s3.${AWS::Region}.amazonaws.com'
+            S3OriginConfig:
+              OriginAccessIdentity: ''
+            OriginAccessControlId: !GetAtt OriginAccessControl.Id
+        DefaultCacheBehavior:
+          TargetOriginId: s3-tinyshare
+          ViewerProtocolPolicy: redirect-to-https
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
+          AllowedMethods: [GET, HEAD]
+          CachedMethods: [GET, HEAD]
+          Compress: true
+          FunctionAssociations:
+            - EventType: viewer-request
+              FunctionARN: !GetAtt ExpiryCheckFunction.FunctionARN
+        HttpVersion: http2and3
+        IPV6Enabled: true
+        Logging:
+          Bucket: !GetAtt LogBucket.DomainName
+          Prefix: 'cf/'
+          IncludeCookies: false
+        ViewerCertificate:
+          AcmCertificateArn: !Ref Certificate
+          SslSupportMethod: sni-only
+          MinimumProtocolVersion: TLSv1.2_2021
+
+  DnsRecord:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Ref Domain
+      Type: A
+      AliasTarget:
+        DNSName: !GetAtt Distribution.DomainName
+        HostedZoneId: Z2FDTNDATAQYW2
+        EvaluateTargetHealth: false
+
+Outputs:
+  BucketName:
+    Value: !Ref ShareBucket
+  LogBucketName:
+    Value: !Ref LogBucket
+  DistributionId:
+    Value: !Ref Distribution
+  ShareUrl:
+    Value: !Sub 'https://${Domain}'
+CFTEMPLATE
+}
+
+# ── setup ─────────────────────────────────────────────────────────────────────
+
+cmd_setup() {
+    echo ""
+    echo "  tinyshare setup"
+    echo "  ───────────────"
+    echo ""
+
+    command -v aws &>/dev/null || die "aws CLI not found — install it: https://aws.amazon.com/cli/"
+    command -v python3 &>/dev/null || die "python3 not found"
+
+    if [[ -f "$CONFIG_FILE" ]]; then
+        warn "Already configured ($CONFIG_FILE exists)."
+        confirm "Re-run setup and overwrite?" || exit 0
+    fi
+
+    # ── AWS profile ───────────────────────────────────────────────────────────
+    local profiles profile_count PROFILE
+    profiles=()
+    while IFS= read -r _line; do [[ -n "$_line" ]] && profiles+=("$_line"); done \
+        < <(aws configure list-profiles 2>/dev/null || echo "default")
+    profile_count=${#profiles[@]}
+
+    if (( profile_count == 1 )); then
+        PROFILE="${profiles[0]}"
+        echo "  AWS profile: ${BOLD}${PROFILE}${NC}"
+    else
+        echo "  AWS profiles:"
+        for i in "${!profiles[@]}"; do
+            printf "    [%d] %s\n" $(( i + 1 )) "${profiles[$i]}"
+        done
+        echo ""
+        read -r -p "  Select profile [1]: " _idx
+        _idx="${_idx:-1}"
+        [[ "$_idx" =~ ^[0-9]+$ ]] && (( _idx >= 1 && _idx <= profile_count )) \
+            || die "Invalid selection"
+        PROFILE="${profiles[$(( _idx - 1 ))]}"
+    fi
+    export AWS_PROFILE="$PROFILE"
+    echo ""
+
+    # ── Route 53 hosted zones ─────────────────────────────────────────────────
+    info "Fetching Route 53 hosted zones..."
+    local zones_json zone_names zone_ids zone_count
+    zones_json=$(aws route53 list-hosted-zones \
+        --query 'HostedZones[*].{name:Name,id:Id}' --output json)
+    zone_names=()
+    while IFS= read -r _line; do [[ -n "$_line" ]] && zone_names+=("$_line"); done \
+        < <(echo "$zones_json" | python3 -c "
+import sys, json
+for z in json.load(sys.stdin): print(z['name'].rstrip('.'))
+")
+    zone_ids=()
+    while IFS= read -r _line; do [[ -n "$_line" ]] && zone_ids+=("$_line"); done \
+        < <(echo "$zones_json" | python3 -c "
+import sys, json
+for z in json.load(sys.stdin): print(z['id'].replace('/hostedzone/', ''))
+")
+    zone_count=${#zone_names[@]}
+    (( zone_count > 0 )) || die "No hosted zones found — create one in Route 53 first"
+
+    echo ""
+    echo "  Route 53 domains:"
+    for i in "${!zone_names[@]}"; do
+        printf "    [%d] %s\n" $(( i + 1 )) "${zone_names[$i]}"
+    done
+    echo ""
+    read -r -p "  Select domain [1]: " _idx
+    _idx="${_idx:-1}"
+    [[ "$_idx" =~ ^[0-9]+$ ]] && (( _idx >= 1 && _idx <= zone_count )) \
+        || die "Invalid selection"
+
+    local BASE_DOMAIN HOSTED_ZONE_ID
+    BASE_DOMAIN="${zone_names[$(( _idx - 1 ))]}"
+    HOSTED_ZONE_ID="${zone_ids[$(( _idx - 1 ))]}"
+
+    read -r -p "  Subdomain prefix [share]: " _sub
+    _sub="${_sub:-share}"
+    _sub=$(echo "$_sub" | tr '[:upper:]' '[:lower:]')
+    _sub="${_sub%%.*}"
+    local DOMAIN="${_sub}.${BASE_DOMAIN}"
+
+    local BUCKET_NAME STACK_NAME
+    BUCKET_NAME="tinyshare-$(echo "$DOMAIN" | tr '.' '-')"
+    STACK_NAME="$BUCKET_NAME"
+
+    echo ""
+    info "Domain:  $DOMAIN"
+    info "Stack:   $STACK_NAME  (CloudFormation, us-east-1)"
+    info "Bucket:  $BUCKET_NAME"
+    info "Profile: $PROFILE"
+    echo ""
+    confirm "Proceed?" || exit 0
+    echo ""
+
+    # ── Deploy CloudFormation stack ───────────────────────────────────────────
+    local CF_TEMPLATE
+    CF_TEMPLATE=$(mktemp /tmp/tinyshare-cf.XXXXXX.yaml)
+    write_cf_template "$CF_TEMPLATE"
+
+    info "Deploying CloudFormation stack..."
+    info "(ACM validation + CloudFront deployment takes ~10 minutes)"
+    echo ""
+    aws cloudformation deploy \
+        --stack-name "$STACK_NAME" \
+        --template-file "$CF_TEMPLATE" \
+        --parameter-overrides \
+            "Domain=$DOMAIN" \
+            "HostedZoneId=$HOSTED_ZONE_ID" \
+            "BucketName=$BUCKET_NAME" \
+        --region us-east-1 \
+        --no-fail-on-empty-changeset
+    rm -f "$CF_TEMPLATE"
+
+    # ── Get stack outputs ─────────────────────────────────────────────────────
+    local OUTPUTS DIST_ID
+    OUTPUTS=$(aws cloudformation describe-stacks \
+        --stack-name "$STACK_NAME" \
+        --region us-east-1 \
+        --query 'Stacks[0].Outputs' \
+        --output json)
+    DIST_ID=$(echo "$OUTPUTS" | python3 -c "
+import sys, json
+o = {x['OutputKey']: x['OutputValue'] for x in json.load(sys.stdin)}
+print(o.get('DistributionId', ''))
+")
+
+    # ── Save config ───────────────────────────────────────────────────────────
+    mkdir -p "$CONFIG_DIR"
+    cat > "$CONFIG_FILE" <<EOF
+TINYSHARE_BUCKET=$BUCKET_NAME
+TINYSHARE_DOMAIN=$DOMAIN
+TINYSHARE_REGION=us-east-1
+TINYSHARE_CF_DIST_ID=$DIST_ID
+TINYSHARE_CF_STACK=$STACK_NAME
+TINYSHARE_AWS_PROFILE=$PROFILE
+EOF
+    chmod 600 "$CONFIG_FILE"
+
+    echo ""
+    printf '  Setup complete!\n'
+    echo ""
+    echo "    https://$DOMAIN"
+    echo ""
+    echo "  Try it:  share myfile.pdf 7d"
+    echo ""
+}
+
+# ── upload ────────────────────────────────────────────────────────────────────
+
+cmd_upload() {
+    load_config
+    local file="$1" duration="${2:-24h}"
+
+    [[ -f "$file" ]] || die "File not found: $file"
+
+    local seconds expiry token mime filename s3_key url
+    seconds=$(parse_duration "$duration")
+    (( seconds <= 2592000 )) || die "Maximum duration is 30d"
+
+    expiry=$(( $(date +%s) + seconds ))
+    token=$(random_token)
+    mime=$(guess_mime "$file")
+    filename=$(basename "$file")
+    s3_key="${expiry}/${token}"
+    url="https://${TINYSHARE_DOMAIN}/${expiry}/${token}"
+
+    info "Uploading $(du -sh "$file" | cut -f1) ..."
+    local _upload_err
+    if ! _upload_err=$(aws s3 cp "$file" "s3://${TINYSHARE_BUCKET}/${s3_key}" \
+        --region "$TINYSHARE_REGION" \
+        --content-type "$mime" \
+        --content-disposition "attachment; filename=\"${filename}\"" \
+        --metadata "filename=${filename}" \
+        --no-progress 2>&1); then
+        die "Upload failed: $_upload_err"
+    fi
+
+    echo ""
+    printf '  \033[1m%s\033[0m\n' "$url"
+    printf '  Expires: %s\n' "$(format_expiry "$expiry")"
+    echo ""
+    copy_to_clipboard "$url"
+    echo ""
+}
+
+# ── list ──────────────────────────────────────────────────────────────────────
+
+cmd_list() {
+    load_config
+    local now
+    now=$(date +%s)
+
+    echo ""
+    printf "  %-20s  %-10s  %-28s  %s\n" "EXPIRES" "TOKEN" "FILE" "STATUS"
+    printf "  %s\n" "──────────────────────────────────────────────────────────────────────"
+
+    local found=0
+    while IFS= read -r line; do
+        local key expiry token filename status expiry_human
+        key=$(echo "$line" | awk '{print $NF}')
+        expiry=$(echo "$key" | cut -d/ -f1)
+        token=$(echo "$key" | cut -d/ -f2)
+        [[ "$expiry" =~ ^[0-9]{10}$ ]] || continue
+
+        filename=$(aws s3api head-object \
+            --bucket "$TINYSHARE_BUCKET" --key "$key" \
+            --region "$TINYSHARE_REGION" \
+            --query 'Metadata.filename' --output text 2>/dev/null || echo "")
+        [[ -z "$filename" || "$filename" == "None" ]] && filename="(unknown)"
+
+        if (( now > expiry )); then
+            status="${RED}expired${NC}"
+        else
+            status="${GREEN}active${NC}"
+        fi
+        expiry_human=$(format_expiry "$expiry")
+
+        printf "  %-20s  %-10s  %-28s  " "$expiry_human" "$token" "$filename"
+        echo -e "$status"
+        found=$(( found + 1 ))
+    done < <(aws s3 ls "s3://${TINYSHARE_BUCKET}/" --recursive --region "$TINYSHARE_REGION" 2>/dev/null)
+
+    if (( found == 0 )); then
+        echo "  No shares found."
+    fi
+    echo ""
+}
+
+# ── revoke ────────────────────────────────────────────────────────────────────
+
+cmd_revoke() {
+    load_config
+    local token="${1:-}"
+    [[ -n "$token" ]] || die "Usage: share revoke <token>"
+
+    local key
+    key=$(aws s3 ls "s3://${TINYSHARE_BUCKET}/" --recursive --region "$TINYSHARE_REGION" \
+        | awk '{print $NF}' | grep "/${token}$" | head -1)
+    [[ -n "$key" ]] || die "Share not found: $token"
+
+    aws s3 rm "s3://${TINYSHARE_BUCKET}/${key}" --region "$TINYSHARE_REGION" > /dev/null
+    aws cloudfront create-invalidation \
+        --distribution-id "$TINYSHARE_CF_DIST_ID" \
+        --paths "/${key}" > /dev/null
+    info "Revoked: $token"
+}
+
+# ── logs ──────────────────────────────────────────────────────────────────────
+
+cmd_logs() {
+    load_config
+    local filter="${1:-}"
+    local log_bucket="${TINYSHARE_BUCKET}-logs"
+
+    echo ""
+
+    # Collect recent log files (last ~100 = ~4 days of traffic)
+    local files=()
+    while IFS= read -r _line; do
+        local _fname
+        _fname=$(echo "$_line" | awk '{print $NF}')
+        [[ "$_fname" =~ \.gz$ ]] && files+=("$_fname")
+    done < <(aws s3 ls "s3://${log_bucket}/cf/" --region us-east-1 2>/dev/null | tail -100)
+
+    if (( ${#files[@]} == 0 )); then
+        echo "  No logs yet — CloudFront delivers logs within ~1 hour of first access."
+        echo "  Log bucket: s3://${log_bucket}/cf/"
+        echo ""
+        return
+    fi
+
+    [[ -n "$filter" ]] && info "Filtering for: $filter" && echo ""
+    printf "  %-19s  %-15s  %-6s  %-14s  %-42s  %s\n" \
+        "DATE/TIME (UTC)" "IP" "STATUS" "EDGE" "USER AGENT" "PATH"
+    printf "  %s\n" \
+        "──────────────────────────────────────────────────────────────────────────────────────────────────────────"
+
+    local tmp_dir found=0
+    tmp_dir=$(mktemp -d /tmp/tinyshare-logs.XXXXXX)
+
+    for _fname in "${files[@]}"; do
+        local _local="${tmp_dir}/${_fname##*/}"
+        aws s3 cp "s3://${log_bucket}/${_fname}" "$_local" \
+            --region us-east-1 --quiet 2>/dev/null || continue
+
+        while IFS= read -r _row; do
+            printf '%s\n' "$_row"
+            found=$(( found + 1 ))
+        done < <(python3 -c "
+import sys, gzip, urllib.parse
+logfile, filt = sys.argv[1], sys.argv[2]
+try:
+    with gzip.open(logfile, 'rt', errors='replace') as f:
+        for line in f:
+            if line.startswith('#') or not line.strip(): continue
+            p = line.strip().split('\t')
+            if len(p) < 11: continue
+            date, time, edge, ip = p[0], p[1][:8], p[2], p[4]
+            uri, status, ua = p[7], p[8], p[10]
+            if filt and filt not in uri: continue
+            ua = urllib.parse.unquote(ua)[:42]
+            print(f'  {date} {time}  {ip:<15}  {status:<6}  {edge:<14}  {ua:<42}  {uri}')
+except Exception:
+    pass
+" "$_local" "$filter" 2>/dev/null || true)
+    done
+
+    rm -rf "$tmp_dir"
+
+    echo ""
+    if (( found == 0 )); then
+        echo "  No matching requests found."
+    else
+        printf "  %d request(s) shown (up to ~4 days, newest last).\n" "$found"
+    fi
+    echo ""
+}
+
+# ── stats ─────────────────────────────────────────────────────────────────────
+
+cmd_stats() {
+    load_config
+    local filter="${1:-}"
+    local log_bucket="${TINYSHARE_BUCKET}-logs"
+
+    echo ""
+
+    local files=()
+    while IFS= read -r _line; do
+        local _fname
+        _fname=$(echo "$_line" | awk '{print $NF}')
+        [[ "$_fname" =~ \.gz$ ]] && files+=("$_fname")
+    done < <(aws s3 ls "s3://${log_bucket}/cf/" --region us-east-1 2>/dev/null | tail -744)
+
+    if (( ${#files[@]} == 0 )); then
+        echo "  No logs yet — CloudFront delivers logs within ~1 hour of first access."
+        echo ""
+        return
+    fi
+
+    local file_count=${#files[@]}
+    info "Processing ${file_count} log file(s)..."
+    [[ -n "$filter" ]] && info "Filtering for: $filter"
+    echo ""
+
+    local tmp_dir
+    tmp_dir=$(mktemp -d /tmp/tinyshare-stats.XXXXXX)
+
+    for _fname in "${files[@]}"; do
+        aws s3 cp "s3://${log_bucket}/${_fname}" "${tmp_dir}/${_fname##*/}" \
+            --region us-east-1 --quiet 2>/dev/null || true
+    done
+
+    python3 - "$tmp_dir" "$filter" <<'PYEOF'
+import sys, gzip, os, urllib.parse
+from collections import defaultdict, Counter
+
+tmp_dir, filt = sys.argv[1], sys.argv[2]
+
+hits   = defaultdict(int)
+uniq   = defaultdict(set)
+first  = {}
+last   = {}
+status_counts = Counter()
+edges  = Counter()
+agents = Counter()
+
+def classify_ua(ua):
+    if 'Edg/' in ua or 'EdgA/' in ua: b = 'Edge'
+    elif 'Chrome' in ua:               b = 'Chrome'
+    elif 'Firefox' in ua:              b = 'Firefox'
+    elif 'Safari' in ua:               b = 'Safari'
+    elif ua.lower().startswith('curl'): b = 'curl'
+    elif 'python' in ua.lower():       b = 'Python'
+    elif 'Wget' in ua:                 b = 'Wget'
+    else:                              b = (ua.split('/')[0] or 'Unknown')[:18]
+    if   'iPhone' in ua or 'iPad' in ua: p = 'iOS'
+    elif 'Android' in ua:                p = 'Android'
+    elif 'Macintosh' in ua:              p = 'macOS'
+    elif 'Windows' in ua:               p = 'Windows'
+    elif 'Linux' in ua:                 p = 'Linux'
+    else:                               p = 'Unknown'
+    return f'{b} / {p}'
+
+for fname in sorted(os.listdir(tmp_dir)):
+    if not fname.endswith('.gz'): continue
+    try:
+        with gzip.open(os.path.join(tmp_dir, fname), 'rt', errors='replace') as f:
+            for line in f:
+                if line.startswith('#') or not line.strip(): continue
+                p = line.strip().split('\t')
+                if len(p) < 11: continue
+                date, time, edge, ip = p[0], p[1][:8], p[2], p[4]
+                uri, status, ua_raw  = p[7], p[8], p[10]
+                parts = uri.strip('/').split('/')
+                if len(parts) < 2 or not parts[0].isdigit(): continue
+                token = parts[1]
+                if filt and filt not in token and filt not in uri: continue
+                ua  = urllib.parse.unquote(ua_raw)
+                dt  = f'{date} {time}'
+                hits[token]  += 1
+                uniq[token].add(ip)
+                first[token]  = min(first.get(token, dt), dt)
+                last[token]   = max(last.get(token,  dt), dt)
+                status_counts[status] += 1
+                edges[edge]  += 1
+                agents[classify_ua(ua)] += 1
+    except Exception:
+        continue
+
+total_hits = sum(hits.values())
+total_ips  = len(set(ip for s in uniq.values() for ip in s))
+
+if not total_hits:
+    print('  No matching requests found.')
+    sys.exit(0)
+
+W = 90
+def rule(): print('  ' + '─' * W)
+
+print(f'  Total requests : {total_hits}')
+print(f'  Unique IPs     : {total_ips}')
+print(f'  Unique tokens  : {len(hits)}')
+
+print()
+print(f'  {"TOKEN":<10}  {"HITS":>5}  {"UNIQ IPs":>8}  {"FIRST ACCESS":<19}  LAST ACCESS')
+rule()
+for token, h in sorted(hits.items(), key=lambda x: -x[1]):
+    print(f'  {token:<10}  {h:>5}  {len(uniq[token]):>8}  {first[token]:<19}  {last[token]}')
+
+STATUS_LABEL = {
+    '200': 'OK', '204': 'No Content', '206': 'Partial', '304': 'Not Modified',
+    '400': 'Bad Request', '403': 'Forbidden', '404': 'Not Found',
+    '410': 'Gone (expired)', '499': 'Client abort', '502': 'Bad Gateway',
+}
+print()
+print('  HTTP statuses:')
+for s, c in sorted(status_counts.items()):
+    print(f'    {s}  {STATUS_LABEL.get(s,""):<22}  {c}')
+
+print()
+print('  Top edge locations (rough geography):')
+for e, c in edges.most_common(8):
+    print(f'    {e:<18}  {c}')
+
+print()
+print('  Client breakdown:')
+for a, c in agents.most_common(10):
+    print(f'    {a:<32}  {c}')
+PYEOF
+
+    rm -rf "$tmp_dir"
+    echo ""
+}
+
+# ── teardown ──────────────────────────────────────────────────────────────────
+
+cmd_teardown() {
+    load_config
+    echo ""
+    warn "This permanently deletes all tinyshare AWS resources."
+    echo ""
+
+    if [[ -n "${TINYSHARE_CF_STACK:-}" ]]; then
+        echo "    CloudFormation stack: $TINYSHARE_CF_STACK"
+        echo "    S3 bucket:           $TINYSHARE_BUCKET (and all files)"
+        echo ""
+        read -r -p "  Type 'delete' to confirm: " ans
+        [[ "$ans" == "delete" ]] || { echo "Aborted."; exit 0; }
+
+        info "Emptying S3 bucket first..."
+        aws s3 rm "s3://${TINYSHARE_BUCKET}" --recursive \
+            --region "$TINYSHARE_REGION" 2>/dev/null || true
+
+        info "Deleting CloudFormation stack (a few minutes)..."
+        aws cloudformation delete-stack \
+            --stack-name "$TINYSHARE_CF_STACK" \
+            --region us-east-1
+        aws cloudformation wait stack-delete-complete \
+            --stack-name "$TINYSHARE_CF_STACK" \
+            --region us-east-1
+
+        local log_bucket="${TINYSHARE_BUCKET}-logs"
+        if aws s3api head-bucket --bucket "$log_bucket" --region us-east-1 2>/dev/null; then
+            echo ""
+            warn "Log bucket s3://${log_bucket} was retained (contains your access logs)."
+            if confirm "Delete log bucket and all logs?"; then
+                aws s3 rm "s3://${log_bucket}" --recursive --region us-east-1 2>/dev/null || true
+                aws s3api delete-bucket --bucket "$log_bucket" --region us-east-1
+                info "Log bucket deleted."
+            fi
+        fi
+    else
+        # Legacy: manually provisioned (pre-CloudFormation setup)
+        echo "    CloudFront dist: $TINYSHARE_CF_DIST_ID"
+        echo "    S3 bucket:       $TINYSHARE_BUCKET (and all files)"
+        echo ""
+        read -r -p "  Type 'delete' to confirm: " ans
+        [[ "$ans" == "delete" ]] || { echo "Aborted."; exit 0; }
+
+        info "Disabling CloudFront distribution..."
+        local DIST_ETAG DIST_CFG DISABLED
+        DIST_ETAG=$(aws cloudfront get-distribution-config \
+            --id "$TINYSHARE_CF_DIST_ID" --query 'ETag' --output text)
+        DIST_CFG=$(aws cloudfront get-distribution-config \
+            --id "$TINYSHARE_CF_DIST_ID" --query 'DistributionConfig')
+        DISABLED=$(echo "$DIST_CFG" | python3 -c \
+            "import sys,json; d=json.load(sys.stdin); d['Enabled']=False; print(json.dumps(d))")
+        aws cloudfront update-distribution \
+            --id "$TINYSHARE_CF_DIST_ID" \
+            --distribution-config "$DISABLED" \
+            --if-match "$DIST_ETAG" > /dev/null
+        info "Waiting for distribution to disable..."
+        aws cloudfront wait distribution-deployed --id "$TINYSHARE_CF_DIST_ID"
+        DIST_ETAG=$(aws cloudfront get-distribution \
+            --id "$TINYSHARE_CF_DIST_ID" --query 'ETag' --output text)
+        aws cloudfront delete-distribution \
+            --id "$TINYSHARE_CF_DIST_ID" --if-match "$DIST_ETAG"
+
+        info "Emptying and deleting S3 bucket..."
+        aws s3 rm "s3://${TINYSHARE_BUCKET}" --recursive --region "$TINYSHARE_REGION" > /dev/null
+        aws s3api delete-bucket --bucket "$TINYSHARE_BUCKET" --region "$TINYSHARE_REGION"
+        warn "DNS records in Route 53 were not removed — delete them manually if needed."
+    fi
+
+    rm -f "$CONFIG_FILE"
+    echo ""
+    info "Teardown complete."
+    echo ""
+}
+
+# ── delete-config ─────────────────────────────────────────────────────────────
+
+cmd_delete_config() {
+    if [[ ! -f "$CONFIG_FILE" ]]; then
+        printf '\nNo config found at %s\n\n' "$CONFIG_FILE"
+        exit 0
+    fi
+    printf '\nThis removes the local config only — AWS resources are NOT deleted.\n'
+    printf 'To also delete AWS resources, run: share teardown\n\n'
+    confirm "Remove $CONFIG_FILE?" || exit 0
+    rm -f "$CONFIG_FILE"
+    echo ""
+    info "Config removed. Run 'share setup' to reconfigure."
+    echo ""
+}
+
+# ── uninstall ─────────────────────────────────────────────────────────────────
+
+cmd_uninstall() {
+    local bin_path
+    bin_path=$(command -v share 2>/dev/null || true)
+    [[ -n "$bin_path" ]] || die "share not found in PATH"
+    confirm "Remove $bin_path?" || exit 0
+    rm "$bin_path"
+    info "Removed $bin_path"
+    info "Config at $CONFIG_DIR was not removed."
+}
+
+# ── help ──────────────────────────────────────────────────────────────────────
+
+cmd_help() {
+    cat <<EOF
+
+  ${BOLD}tinyshare${NC} — create time-limited file share links via S3 + CloudFront
+
+  ${BOLD}USAGE${NC}
+    share setup                  One-time AWS setup via CloudFormation
+    share <file> [duration]      Upload file and print a share URL
+    share list                   List all shares and their status
+    share revoke <token>         Delete a share immediately
+    share logs [token]           Show raw access log rows
+    share stats [token]          Aggregate stats: hits, IPs, browsers, edges
+    share teardown               Destroy all AWS infrastructure
+    share delete-config          Remove local config (keeps AWS resources)
+    share uninstall              Remove share from PATH
+    share help                   Show this help
+
+  ${BOLD}DURATION${NC}
+    1h  6h  24h (default)  7d  30d
+
+  ${BOLD}EXAMPLES${NC}
+    share report.pdf             Share for 24 hours
+    share photo.jpg 7d           Share for 7 days
+    share archive.zip 1h         Share for 1 hour
+    share list                   Show all shares
+    share revoke aB3xKm9P        Immediately delete a share
+
+  ${BOLD}CONFIG${NC}
+    $CONFIG_FILE
+
+EOF
+}
+
+# ── dispatch ──────────────────────────────────────────────────────────────────
+
+CMD="${1:-help}"
+shift || true
+
+case "$CMD" in
+    setup)             cmd_setup ;;
+    list)              cmd_list ;;
+    revoke)            cmd_revoke "${1:-}" ;;
+    logs)              cmd_logs "${1:-}" ;;
+    stats)             cmd_stats "${1:-}" ;;
+    teardown)          cmd_teardown ;;
+    delete-config)     cmd_delete_config ;;
+    uninstall)         cmd_uninstall ;;
+    help|--help|-h)    cmd_help ;;
+    *)                 cmd_upload "$CMD" "${1:-24h}" ;;
+esac
