@@ -343,7 +343,7 @@ cmd_upload() {
     printf '  \033[1m%s\033[0m\n' "$url"
     if [[ -n "$ALIAS" ]]; then
         local alias_url="https://${TINYSHARE_DOMAIN}/${ALIAS}"
-        printf '  \033[1m%s\033[0m  (alias)\n' "$alias_url"
+        printf '  \033[1m%s\033[0m  (alias — live in ~5 min)\n' "$alias_url"
     fi
     printf '  Expires: %s\n' "$(format_expiry "$expiry")"
     echo ""
