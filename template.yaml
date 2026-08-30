@@ -20,6 +20,28 @@ Resources:
       Name: !Sub '${AWS::StackName}-aliases'
       Comment: Alias to share path mappings
 
+  LambdaEdgeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: [lambda.amazonaws.com, edgelambda.amazonaws.com]
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: tinyshare-lambda-edge
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [cloudfront-keyvaluestore:GetKey, cloudfront-keyvaluestore:PutKey]
+                Resource: !GetAtt AliasStore.Arn
+              - Effect: Allow
+                Action: [logs:CreateLogGroup, logs:CreateLogStream, logs:PutLogEvents]
+                Resource: 'arn:aws:logs:*:*:*'
+
   ShareBucket:
     Type: AWS::S3::Bucket
     DeletionPolicy: Delete
@@ -132,8 +154,78 @@ Resources:
             if (Math.floor(Date.now() / 1000) > parseInt(parts[0], 10)) {
                 return { statusCode: 410, statusDescription: 'Gone', headers: { 'content-type': { value: 'text/html' }, 'cache-control': { value: 'no-store' } }, body: '<!DOCTYPE html><html><head><title>Expired</title><style>body{font-family:system-ui;max-width:400px;margin:80px auto;text-align:center;color:#555}h1{color:#222}</style></head><body><h1>Link expired</h1><p>This share link is no longer valid.</p></body></html>' };
             }
+            // Check download limit (dl: prefix in KVS)
+            try {
+                var dlCount = await kvsHandle.get('dl:' + parts[1]);
+                if (parseInt(dlCount, 10) === 0) {
+                    return { statusCode: 410, statusDescription: 'Gone', headers: { 'content-type': { value: 'text/html' }, 'cache-control': { value: 'no-store' } }, body: '<!DOCTYPE html><html><head><title>Link used</title><style>body{font-family:system-ui;max-width:400px;margin:80px auto;text-align:center;color:#555}h1{color:#222}</style></head><body><h1>Link already used</h1><p>This link has reached its download limit. Contact the sender to request a new one.</p></body></html>' };
+                }
+            } catch(e) { /* no limit set — proceed */ }
             return event.request;
         }
+
+  ViewerResponseFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-viewer-response'
+      Runtime: nodejs20.x
+      Handler: index.handler
+      Role: !GetAtt LambdaEdgeRole.Arn
+      Timeout: 5
+      MemorySize: 128
+      Code:
+        ZipFile: !Sub |
+          'use strict';
+          const h=require('https'),c=require('crypto');
+          const A='${AliasStore.Arn}';
+          const HOST='cloudfront-keyvaluestore.amazonaws.com';
+          const hm=(k,v)=>c.createHmac('sha256',k).update(v).digest();
+          const sh=(v)=>c.createHash('sha256').update(v).digest('hex');
+          function kvsReq(method,key,body,etag){
+            return new Promise((res,rej)=>{
+              const ak=process.env.AWS_ACCESS_KEY_ID,secret=process.env.AWS_SECRET_ACCESS_KEY,st=process.env.AWS_SESSION_TOKEN;
+              const now=new Date().toISOString();
+              const d=now.slice(0,10).replace(/-/g,''),t=now.replace(/[-:.Z]/g,'').slice(0,15)+'Z';
+              const upath='/key-value-stores/'+encodeURIComponent(A)+'/keys/'+encodeURIComponent(key);
+              const payload=body||'';
+              const ph=sh(payload);
+              const hdrs={'host':HOST,'x-amz-content-sha256':ph,'x-amz-date':t};
+              if(st)hdrs['x-amz-security-token']=st;
+              if(etag)hdrs['if-match']=etag;
+              if(body){hdrs['content-type']='application/json';hdrs['content-length']=''+Buffer.byteLength(payload);}
+              const hk=Object.keys(hdrs).sort();
+              const cr=[method,upath,'',hk.map(k=>k+':'+hdrs[k]).join('\n'),'',hk.join(';'),ph].join('\n');
+              const scope=d+'/us-east-1/cloudfront-keyvaluestore/aws4_request';
+              const sts=['AWS4-HMAC-SHA256',t,scope,sh(cr)].join('\n');
+              const sk=hm(hm(hm(hm('AWS4'+secret,d),'us-east-1'),'cloudfront-keyvaluestore'),'aws4_request');
+              hdrs.authorization='AWS4-HMAC-SHA256 Credential='+ak+'/'+scope+', SignedHeaders='+hk.join(';')+', Signature='+c.createHmac('sha256',sk).update(sts).digest('hex');
+              const req=h.request({hostname:HOST,path:upath,method,headers:hdrs},r=>{
+                let data='';r.on('data',x=>data+=x);r.on('end',()=>res({s:r.statusCode,e:r.headers.etag,b:data}));
+              });
+              req.on('error',rej);if(payload)req.write(payload);req.end();
+            });
+          }
+          exports.handler=async(event)=>{
+            const{request:q,response:r}=event.Records[0].cf;
+            if(r.status!=='200')return r;
+            const p=q.uri.replace(/^\/+/,'').split('/');
+            if(p.length<2||!/^\d{10}$/.test(p[0])||!/^[A-Za-z0-9]{8}$/.test(p[1]))return r;
+            try{
+              const k='dl:'+p[1];
+              const g=await kvsReq('GET',k);
+              if(g.s!==200)return r;
+              const n=parseInt(JSON.parse(g.b).Value,10);
+              if(isNaN(n)||n<=0)return r;
+              await kvsReq('PUT',k,JSON.stringify({Value:''+Math.max(0,n-1)}),g.e);
+            }catch(e){}
+            return r;
+          };
+
+  ViewerResponseVersion:
+    Type: AWS::Lambda::Version
+    DeletionPolicy: Retain
+    Properties:
+      FunctionName: !Ref ViewerResponseFunction
 
   Certificate:
     Type: AWS::CertificateManager::Certificate
@@ -168,6 +260,9 @@ Resources:
           FunctionAssociations:
             - EventType: viewer-request
               FunctionARN: !GetAtt ExpiryCheckFunction.FunctionARN
+          LambdaFunctionAssociations:
+            - EventType: viewer-response
+              LambdaFunctionARN: !Ref ViewerResponseVersion
         HttpVersion: http2and3
         IPV6Enabled: true
         Logging:

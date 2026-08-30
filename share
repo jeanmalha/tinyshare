@@ -5,6 +5,8 @@
 #   share setup                        One-time AWS infrastructure setup (CloudFormation)
 #   share <file> [duration]            Upload and print a share URL
 #   share <file> [duration] --alias=NAME  Upload with a custom vanity alias
+#   share <file> [duration] --once     Upload with a 1-download limit
+#   share <file> [duration] --downloads=N  Upload with an N-download limit
 #   share list                         List all shares
 #   share revoke <token|alias>         Delete a share immediately
 #   share teardown                     Destroy all AWS infrastructure
@@ -263,12 +265,14 @@ cmd_upload() {
     load_config
     local file="$1"
     shift
-    local duration="24h" QR=0 ALIAS=""
+    local duration="24h" QR=0 ALIAS="" DOWNLOADS=""
     for _arg in "$@"; do
         case "$_arg" in
-            --qr)       QR=1 ;;
-            --alias=*)  ALIAS="${_arg#--alias=}" ;;
-            *)          duration="$_arg" ;;
+            --qr)          QR=1 ;;
+            --alias=*)     ALIAS="${_arg#--alias=}" ;;
+            --once)        DOWNLOADS=1 ;;
+            --downloads=*) DOWNLOADS="${_arg#--downloads=}" ;;
+            *)             duration="$_arg" ;;
         esac
     done
 
@@ -290,6 +294,12 @@ cmd_upload() {
     else tier="30d"
     fi
 
+    # Validate downloads flag
+    if [[ -n "$DOWNLOADS" ]]; then
+        [[ "$DOWNLOADS" =~ ^[0-9]+$ && "$DOWNLOADS" -ge 1 ]] \
+            || die "--downloads must be a positive integer (e.g. --downloads=5 or --once)"
+    fi
+
     # Validate alias before uploading
     if [[ -n "$ALIAS" ]]; then
         [[ "$ALIAS" =~ ^[a-zA-Z0-9-]{2,32}$ ]] \
@@ -308,6 +318,7 @@ cmd_upload() {
     # Build metadata string
     local metadata="filename=${filename}"
     [[ -n "$ALIAS" ]] && metadata="${metadata},alias=${ALIAS}"
+    [[ -n "$DOWNLOADS" ]] && metadata="${metadata},download-limit=${DOWNLOADS}"
 
     info "Uploading $(du -sh "$file" | cut -f1) ..."
     local _upload_err
@@ -339,6 +350,18 @@ cmd_upload() {
             --if-match "$kvs_etag" > /dev/null
     fi
 
+    # Register download limit in KVS
+    if [[ -n "$DOWNLOADS" && -n "${TINYSHARE_KVS_ARN:-}" ]]; then
+        local kvs_etag
+        kvs_etag=$(aws cloudfront-keyvaluestore describe-key-value-store \
+            --kvs-arn "$TINYSHARE_KVS_ARN" --query 'ETag' --output text)
+        aws cloudfront-keyvaluestore put-key \
+            --kvs-arn "$TINYSHARE_KVS_ARN" \
+            --key "dl:${token}" \
+            --value "$DOWNLOADS" \
+            --if-match "$kvs_etag" > /dev/null
+    fi
+
     echo ""
     printf '  \033[1m%s\033[0m\n' "$url"
     if [[ -n "$ALIAS" ]]; then
@@ -346,6 +369,7 @@ cmd_upload() {
         printf '  \033[1m%s\033[0m  (alias — live in ~5 min)\n' "$alias_url"
     fi
     printf '  Expires: %s\n' "$(format_expiry "$expiry")"
+    [[ -n "$DOWNLOADS" ]] && printf '  Downloads allowed: %s\n' "$DOWNLOADS"
     echo ""
     if [[ -n "$ALIAS" ]]; then
         copy_to_clipboard "https://${TINYSHARE_DOMAIN}/${ALIAS}"
@@ -364,12 +388,12 @@ cmd_list() {
     now=$(date +%s)
 
     echo ""
-    printf "  %-8s  %-24s  %-14s  %-20s  %s\n" "STATUS" "FILE" "ALIAS" "EXPIRES" "URL"
+    printf "  %-8s  %-24s  %-14s  %-4s  %-20s  %s\n" "STATUS" "FILE" "ALIAS" "LIM" "EXPIRES" "URL"
     printf "  %s\n" "──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────"
 
     local found=0
     while IFS= read -r line; do
-        local key expiry token meta filename alias_val expiry_human url
+        local key expiry token meta filename alias_val limit_val expiry_human url
         key=$(echo "$line" | awk '{print $NF}')
         expiry=$(echo "$key" | cut -d/ -f1)
         token=$(echo "$key" | cut -d/ -f2)
@@ -380,26 +404,22 @@ cmd_list() {
             --bucket "$TINYSHARE_BUCKET" --key "$key" \
             --region "$TINYSHARE_REGION" \
             --query 'Metadata' --output json 2>/dev/null || echo '{}')
-        filename=$(echo "$meta" | python3 -c "
+        read -r filename alias_val limit_val < <(echo "$meta" | python3 -c "
 import sys, json
 m = json.load(sys.stdin) or {}
-print(m.get('filename', '') or '')
-" 2>/dev/null || true)
-        alias_val=$(echo "$meta" | python3 -c "
-import sys, json
-m = json.load(sys.stdin) or {}
-print(m.get('alias', '') or '')
-" 2>/dev/null || true)
+print(m.get('filename', '') or '', m.get('alias', '') or '', m.get('download-limit', '') or '', sep='\t')
+" 2>/dev/null | tr '\t' '\n' | { read -r f; read -r a; read -r l; printf '%s\t%s\t%s' "$f" "$a" "$l"; } || printf '\t\t')
         [[ -z "$filename" || "$filename" == "None" ]] && filename="(unknown)"
         [[ "$alias_val" == "None" ]] && alias_val=""
+        [[ "$limit_val" == "None" ]] && limit_val=""
 
         url="https://${TINYSHARE_DOMAIN}/${key}"
         expiry_human=$(format_expiry "$expiry")
 
         if (( now > expiry )); then
-            printf "  ${RED}%-8s${NC}  %-24s  %-14s  %-20s  %s\n" "expired" "${filename:0:24}" "${alias_val:0:14}" "$expiry_human" "$url"
+            printf "  ${RED}%-8s${NC}  %-24s  %-14s  %-4s  %-20s  %s\n" "expired" "${filename:0:24}" "${alias_val:0:14}" "${limit_val:0:4}" "$expiry_human" "$url"
         else
-            printf "  ${GREEN}%-8s${NC}  %-24s  %-14s  %-20s  %s\n" "active" "${filename:0:24}" "${alias_val:0:14}" "$expiry_human" "$url"
+            printf "  ${GREEN}%-8s${NC}  %-24s  %-14s  %-4s  %-20s  %s\n" "active" "${filename:0:24}" "${alias_val:0:14}" "${limit_val:0:4}" "$expiry_human" "$url"
         fi
         found=$(( found + 1 ))
     done < <(aws s3 ls "s3://${TINYSHARE_BUCKET}/" --recursive --region "$TINYSHARE_REGION" 2>/dev/null)
@@ -461,6 +481,20 @@ print(m.get('alias', '') or '')
                 --kvs-arn "$TINYSHARE_KVS_ARN" \
                 --key "$alias_val" \
                 --if-match "$kvs_etag" > /dev/null 2>/dev/null || true
+        fi
+    fi
+
+    # Clean up download-limit KVS entry
+    if [[ -n "${TINYSHARE_KVS_ARN:-}" ]]; then
+        local token dl_etag
+        token="${key##*/}"
+        dl_etag=$(aws cloudfront-keyvaluestore describe-key-value-store \
+            --kvs-arn "$TINYSHARE_KVS_ARN" --query 'ETag' --output text 2>/dev/null || true)
+        if [[ -n "$dl_etag" && "$dl_etag" != "None" ]]; then
+            aws cloudfront-keyvaluestore delete-key \
+                --kvs-arn "$TINYSHARE_KVS_ARN" \
+                --key "dl:${token}" \
+                --if-match "$dl_etag" > /dev/null 2>/dev/null || true
         fi
     fi
 
@@ -598,17 +632,21 @@ cmd_stats() {
             --region us-east-1 --quiet 2>/dev/null || true
     done
 
-    # Build token→filename map from S3 object metadata
+    # Build token→filename+limit map from S3 object metadata
     local _map="${tmp_dir}/_names.tsv"
     touch "$_map"
     while IFS= read -r _key; do
-        local _tok _fn
+        local _tok _meta _fn _lim
         _tok="${_key##*/}"
-        _fn=$(aws s3api head-object \
+        _meta=$(aws s3api head-object \
             --bucket "$TINYSHARE_BUCKET" --key "$_key" \
             --region "$TINYSHARE_REGION" \
-            --query 'Metadata.filename' --output text 2>/dev/null || true)
-        [[ -n "$_fn" && "$_fn" != "None" ]] && printf '%s\t%s\n' "$_tok" "$_fn" >> "$_map"
+            --query 'Metadata' --output json 2>/dev/null || echo '{}')
+        _fn=$(echo "$_meta" | python3 -c "import sys,json; m=json.load(sys.stdin) or {}; print(m.get('filename','') or '')" 2>/dev/null || true)
+        _lim=$(echo "$_meta" | python3 -c "import sys,json; m=json.load(sys.stdin) or {}; print(m.get('download-limit','') or '')" 2>/dev/null || true)
+        [[ "$_fn" == "None" ]] && _fn=""
+        [[ "$_lim" == "None" ]] && _lim=""
+        printf '%s\t%s\t%s\n' "$_tok" "$_fn" "$_lim" >> "$_map"
     done < <(aws s3 ls "s3://${TINYSHARE_BUCKET}/" --recursive \
         --region "$TINYSHARE_REGION" 2>/dev/null | \
         awk '{print $NF}' | grep -E '^[0-9]{10}/[A-Za-z0-9]{8}$'; true)
@@ -618,11 +656,16 @@ import sys, gzip, os, urllib.parse
 from collections import defaultdict, Counter
 
 tmp_dir, filt, map_file = sys.argv[1], sys.argv[2], sys.argv[3]
-names = {}
+names  = {}
+limits = {}
 with open(map_file) as mf:
     for ln in mf:
-        parts = ln.rstrip('\n').split('\t', 1)
-        if len(parts) == 2: names[parts[0]] = parts[1]
+        parts = ln.rstrip('\n').split('\t', 2)
+        if len(parts) >= 1:
+            tok = parts[0]
+            names[tok] = parts[1] if len(parts) > 1 else ''
+            if len(parts) > 2 and parts[2].strip().isdigit():
+                limits[tok] = int(parts[2].strip())
 
 hits   = defaultdict(int)
 uniq   = defaultdict(set)
@@ -695,6 +738,13 @@ rule()
 for token, h in sorted(hits.items(), key=lambda x: -x[1]):
     fname = names.get(token, '')[:28]
     print(f'  {token:<10}  {fname:<28}  {h:>5}  {len(uniq[token]):>8}  {first[token]:<19}  {last[token]}')
+
+overages = [(t, hits[t], limits[t]) for t in hits if t in limits and hits[t] > limits[t]]
+if overages:
+    print()
+    for t, h, lim in sorted(overages, key=lambda x: -(x[1]-x[2])):
+        over = h - lim
+        print(f'  ⚠  {t}: {h} downloads, limit was {lim} (+{over} over — possible race)')
 
 STATUS_LABEL = {
     '200': 'OK', '204': 'No Content', '206': 'Partial', '304': 'Not Modified',
@@ -1000,6 +1050,8 @@ cmd_help() {
     share <file> [duration]              Upload file and print a share URL
     share <file> [duration] --qr         Upload and also display a QR code
     share <file> [duration] --alias=NAME Upload with a custom vanity alias
+    share <file> [duration] --once       Upload with a 1-download limit
+    share <file> [duration] --downloads=N  Upload with an N-download limit
     share qr <token|url>                 Display QR code for an existing share
     share list                           List all shares and their status
     share revoke <token|alias>           Delete a share immediately
@@ -1018,6 +1070,8 @@ cmd_help() {
     share photo.jpg 7d           Share for 7 days
     share photo.jpg 7d --qr      Share and show QR code
     share photo.jpg 7d --alias=oreo  Share with alias → https://domain/oreo
+    share file.pdf --once        Share with a 1-download limit (link dies after one download)
+    share file.pdf --downloads=5 Share with a 5-download limit
     share archive.zip 1h         Share for 1 hour
     share qr aB3xKm9P            Show QR for an existing share
     share list                   Show all shares
