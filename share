@@ -109,9 +109,6 @@ Resources:
         RestrictPublicBuckets: true
       LifecycleConfiguration:
         Rules:
-          - Id: expire-shares-fallback
-            Status: Enabled
-            ExpirationInDays: 31
           - Id: expire-tier-1d
             Status: Enabled
             TagFilters:
@@ -124,6 +121,15 @@ Resources:
               - Key: expiry-tier
                 Value: 7d
             ExpirationInDays: 8
+          - Id: expire-tier-30d
+            Status: Enabled
+            TagFilters:
+              - Key: expiry-tier
+                Value: 30d
+            ExpirationInDays: 31
+          - Id: expire-shares-fallback
+            Status: Enabled
+            ExpirationInDays: 35
 
   BucketPolicy:
     Type: AWS::S3::BucketPolicy

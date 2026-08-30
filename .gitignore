@@ -1,1 +1,4 @@
 config.env
+.claude/
+.DS_Store
+test.txt
