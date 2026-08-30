@@ -67,6 +67,17 @@ format_expiry() {
         || echo "(expires: $1)"
 }
 
+show_qr() {
+    if ! command -v qrencode &>/dev/null; then
+        warn "qrencode not found — install it to display QR codes:"
+        echo "    macOS:  brew install qrencode"
+        echo "    Linux:  sudo apt install qrencode"
+        return
+    fi
+    echo ""
+    qrencode -t UTF8 -m 1 "$1"
+}
+
 copy_to_clipboard() {
     if command -v pbcopy &>/dev/null; then
         echo -n "$1" | pbcopy 2>/dev/null \
@@ -415,7 +426,15 @@ EOF
 
 cmd_upload() {
     load_config
-    local file="$1" duration="${2:-24h}"
+    local file="$1"
+    shift
+    local duration="24h" QR=0
+    for _arg in "$@"; do
+        case "$_arg" in
+            --qr) QR=1 ;;
+            *)    duration="$_arg" ;;
+        esac
+    done
 
     [[ -f "$file" ]] || die "File not found: $file"
 
@@ -457,6 +476,7 @@ cmd_upload() {
     printf '  Expires: %s\n' "$(format_expiry "$expiry")"
     echo ""
     copy_to_clipboard "$url"
+    (( QR )) && show_qr "$url"
     echo ""
 }
 
@@ -880,6 +900,29 @@ cmd_uninstall() {
     info "Config at $CONFIG_DIR was not removed."
 }
 
+# ── qr ───────────────────────────────────────────────────────────────────────
+
+cmd_qr() {
+    load_config
+    local arg="${1:-}"
+    [[ -n "$arg" ]] || die "Usage: share qr <token|url>"
+
+    local url
+    if [[ "$arg" == https://* ]]; then
+        url="$arg"
+    else
+        local key
+        key=$(aws s3 ls "s3://${TINYSHARE_BUCKET}/" --recursive --region "$TINYSHARE_REGION" \
+            | awk '{print $NF}' | grep "/${arg}$" | head -1)
+        [[ -n "$key" ]] || die "Share not found: $arg"
+        url="https://${TINYSHARE_DOMAIN}/${key}"
+    fi
+
+    printf '\n  %s\n' "$url"
+    show_qr "$url"
+    echo ""
+}
+
 # ── help ──────────────────────────────────────────────────────────────────────
 
 cmd_help() {
@@ -890,6 +933,8 @@ cmd_help() {
   ${BOLD}USAGE${NC}
     share setup                  One-time AWS setup via CloudFormation
     share <file> [duration]      Upload file and print a share URL
+    share <file> [duration] --qr Upload and also display a QR code
+    share qr <token|url>         Display QR code for an existing share
     share list                   List all shares and their status
     share revoke <token>         Delete a share immediately
     share logs [token]           Show raw access log rows
@@ -905,7 +950,9 @@ cmd_help() {
   ${BOLD}EXAMPLES${NC}
     share report.pdf             Share for 24 hours
     share photo.jpg 7d           Share for 7 days
+    share photo.jpg 7d --qr      Share and show QR code
     share archive.zip 1h         Share for 1 hour
+    share qr aB3xKm9P            Show QR for an existing share
     share list                   Show all shares
     share revoke aB3xKm9P        Immediately delete a share
 
@@ -930,5 +977,6 @@ case "$CMD" in
     delete-config)     cmd_delete_config ;;
     uninstall)         cmd_uninstall ;;
     help|--help|-h)    cmd_help ;;
-    *)                 cmd_upload "$CMD" "${1:-24h}" ;;
+    qr)                cmd_qr "${1:-}" ;;
+    *)                 cmd_upload "$CMD" "$@" ;;
 esac
