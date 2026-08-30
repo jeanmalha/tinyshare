@@ -23,7 +23,7 @@ warn()    { echo -e "${YELLOW}⚠${NC}  $*"; }
 die()     { printf '\nError: %s\n\n' "$*"; exit 1; }
 confirm() { read -r -p "$1 [y/N] " _ans; [[ "$_ans" =~ ^[Yy]$ ]]; }
 
-trap 'printf "\nError: unexpected failure on line %s\n\n" "$LINENO"' ERR
+trap 'printf "\nError on line %s: %s\n\n" "$LINENO" "$BASH_COMMAND"' ERR
 
 load_config() {
     [[ -f "$CONFIG_FILE" ]] || die "Not configured — run: share setup"
@@ -436,10 +436,15 @@ cmd_upload() {
         --content-type "$mime" \
         --content-disposition "attachment; filename=\"${filename}\"" \
         --metadata "filename=${filename}" \
-        --tagging "expiry-tier=${tier}" \
         --no-progress 2>&1); then
         die "Upload failed: $_upload_err"
     fi
+    aws s3api put-object-tagging \
+        --bucket "$TINYSHARE_BUCKET" \
+        --key "$s3_key" \
+        --region "$TINYSHARE_REGION" \
+        --tagging "{\"TagSet\":[{\"Key\":\"expiry-tier\",\"Value\":\"${tier}\"}]}" \
+        2>/dev/null || true
 
     echo ""
     printf '  \033[1m%s\033[0m\n' "$url"
