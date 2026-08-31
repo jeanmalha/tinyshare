@@ -120,56 +120,75 @@ Resources:
         SigningBehavior: always
         SigningProtocol: sigv4
 
-  # CloudFront Function: runs at every PoP on viewer-request.
-  # Handles expiry, alias redirects, and download-limit gating (read-only KVS).
-  ExpiryCheckFunction:
-    Type: AWS::CloudFront::Function
+  # Lambda@Edge viewer-request: expiry check, alias redirect, download-limit gate.
+  # Fires at every PoP before the request is forwarded to origin or cache.
+  RequestFunction:
+    Type: AWS::Lambda::Function
     Properties:
-      Name: !Sub '${AWS::StackName}-expiry-check'
-      AutoPublish: true
-      FunctionConfig:
-        Comment: Validates share link expiry and resolves aliases
-        Runtime: cloudfront-js-2.0
-        KeyValueStoreAssociations:
-          - KeyValueStoreARN: !GetAtt AliasStore.Arn
-      FunctionCode: |
-        import cf from 'cloudfront';
-        const kvsHandle = cf.kvs();
-
-        async function handler(event) {
-            var uri = event.request.uri;
-            var parts = uri.replace(/^\/+/, '').split('/');
-
-            // Single segment that is not a 10-digit epoch → alias lookup
-            if (parts.length === 1 && parts[0].length > 0 && !/^\d{10}$/.test(parts[0])) {
-                try {
-                    var target = await kvsHandle.get(parts[0]);
-                    return { statusCode: 302, statusDescription: 'Found', headers: { 'location': { value: '/' + target }, 'cache-control': { value: 'no-store' } } };
-                } catch (e) {
-                    return { statusCode: 404, statusDescription: 'Not Found', headers: { 'content-type': { value: 'text/plain' } }, body: 'Not found' };
-                }
+      Runtime: nodejs20.x
+      Handler: index.handler
+      Role: !GetAtt LambdaEdgeRole.Arn
+      Timeout: 5
+      MemorySize: 128
+      Code:
+        ZipFile: !Sub |
+          'use strict';
+          const h=require('https'),c=require('crypto');
+          const A='${AliasStore.Arn}';
+          const HOST='cloudfront-keyvaluestore.amazonaws.com';
+          const hm=(k,v)=>c.createHmac('sha256',k).update(v).digest();
+          const sh=(v)=>c.createHash('sha256').update(v).digest('hex');
+          function kvsReq(method,key,body,etag){
+            return new Promise((res,rej)=>{
+              const ak=process.env.AWS_ACCESS_KEY_ID,secret=process.env.AWS_SECRET_ACCESS_KEY,st=process.env.AWS_SESSION_TOKEN;
+              const now=new Date().toISOString();
+              const d=now.slice(0,10).replace(/-/g,''),t=now.replace(/[-:.Z]/g,'').slice(0,15)+'Z';
+              const upath='/key-value-stores/'+encodeURIComponent(A)+'/keys/'+encodeURIComponent(key);
+              const payload=body||'';
+              const ph=sh(payload);
+              const hdrs={'host':HOST,'x-amz-content-sha256':ph,'x-amz-date':t};
+              if(st)hdrs['x-amz-security-token']=st;
+              if(etag)hdrs['if-match']=etag;
+              if(body){hdrs['content-type']='application/json';hdrs['content-length']=''+Buffer.byteLength(payload);}
+              const hk=Object.keys(hdrs).sort();
+              const cr=[method,upath,'',hk.map(k=>k+':'+hdrs[k]).join('\n'),'',hk.join(';'),ph].join('\n');
+              const scope=d+'/us-east-1/cloudfront-keyvaluestore/aws4_request';
+              const sts=['AWS4-HMAC-SHA256',t,scope,sh(cr)].join('\n');
+              const sk=hm(hm(hm(hm('AWS4'+secret,d),'us-east-1'),'cloudfront-keyvaluestore'),'aws4_request');
+              hdrs.authorization='AWS4-HMAC-SHA256 Credential='+ak+'/'+scope+', SignedHeaders='+hk.join(';')+', Signature='+c.createHmac('sha256',sk).update(sts).digest('hex');
+              const req=h.request({hostname:HOST,path:upath,method,headers:hdrs},r=>{
+                let data='';r.on('data',x=>data+=x);r.on('end',()=>res({s:r.statusCode,e:r.headers.etag,b:data}));
+              });
+              req.on('error',rej);if(payload)req.write(payload);req.end();
+            });
+          }
+          const GONE_EXP='<!DOCTYPE html><html><head><title>Expired</title><style>body{font-family:system-ui;max-width:400px;margin:80px auto;text-align:center;color:#555}h1{color:#222}</style></head><body><h1>Link expired</h1><p>This share link is no longer valid.</p></body></html>';
+          const GONE_DL='<!DOCTYPE html><html><head><title>Link used</title><style>body{font-family:system-ui;max-width:400px;margin:80px auto;text-align:center;color:#555}h1{color:#222}</style></head><body><h1>Link already used</h1><p>This link has reached its download limit. Contact the sender to request a new one.</p></body></html>';
+          const R410=(b)=>({status:'410',statusDescription:'Gone',headers:{'content-type':[{key:'Content-Type',value:'text/html'}],'cache-control':[{key:'Cache-Control',value:'no-store'}]},body:b});
+          exports.handler=async(event)=>{
+            const q=event.Records[0].cf.request;
+            const p=q.uri.replace(/^\/+/,'').split('/');
+            if(p.length===1&&p[0]&&!/^\d{10}$/.test(p[0])){
+              try{
+                const g=await kvsReq('GET',p[0]);
+                if(g.s!==200)throw 0;
+                return{status:'302',statusDescription:'Found',headers:{location:[{key:'Location',value:'/'+JSON.parse(g.b).Value}],'cache-control':[{key:'Cache-Control',value:'no-store'}]}};
+              }catch(e){return{status:'404',statusDescription:'Not Found',headers:{'content-type':[{key:'Content-Type',value:'text/plain'}]},body:'Not found'};}
             }
+            if(p.length<2||!/^\d{10}$/.test(p[0]))return{status:'400',statusDescription:'Bad Request',headers:{'content-type':[{key:'Content-Type',value:'text/plain'}]},body:'Invalid link'};
+            if(Math.floor(Date.now()/1000)>parseInt(p[0],10))return R410(GONE_EXP);
+            try{const g=await kvsReq('GET','dl:'+p[1]);if(g.s===200&&parseInt(JSON.parse(g.b).Value,10)===0)return R410(GONE_DL);}catch(e){}
+            return q;
+          };
 
-            if (parts.length < 2 || !/^\d{10}$/.test(parts[0])) {
-                return { statusCode: 400, statusDescription: 'Bad Request', headers: { 'content-type': { value: 'text/plain' } }, body: 'Invalid link' };
-            }
-            if (Math.floor(Date.now() / 1000) > parseInt(parts[0], 10)) {
-                return { statusCode: 410, statusDescription: 'Gone', headers: { 'content-type': { value: 'text/html' }, 'cache-control': { value: 'no-store' } }, body: '<!DOCTYPE html><html><head><title>Expired</title><style>body{font-family:system-ui;max-width:400px;margin:80px auto;text-align:center;color:#555}h1{color:#222}</style></head><body><h1>Link expired</h1><p>This share link is no longer valid.</p></body></html>' };
-            }
-            // Check download limit (dl: prefix in KVS)
-            try {
-                var dlCount = await kvsHandle.get('dl:' + parts[1]);
-                if (parseInt(dlCount, 10) === 0) {
-                    return { statusCode: 410, statusDescription: 'Gone', headers: { 'content-type': { value: 'text/html' }, 'cache-control': { value: 'no-store' } }, body: '<!DOCTYPE html><html><head><title>Link used</title><style>body{font-family:system-ui;max-width:400px;margin:80px auto;text-align:center;color:#555}h1{color:#222}</style></head><body><h1>Link already used</h1><p>This link has reached its download limit. Contact the sender to request a new one.</p></body></html>' };
-                }
-            } catch(e) { /* no limit set — proceed */ }
-            return event.request;
-        }
+  RequestVersion:
+    Type: AWS::Lambda::Version
+    DeletionPolicy: Retain
+    Properties:
+      FunctionName: !Ref RequestFunction
 
-  # Lambda@Edge: runs at regional edge on origin-response (cache miss only).
-  # Decrements the dl: counter in KVS after S3 serves a 200.
-  # Limited-download files are uploaded with Cache-Control: no-store so every
-  # request is a cache miss and this function fires on every download.
+  # Lambda@Edge viewer-response: decrements the dl: counter after every 200.
+  # Fires on every response to the viewer (cache hit or miss).
   DecrementFunction:
     Type: AWS::Lambda::Function
     Properties:
@@ -262,11 +281,10 @@ Resources:
           AllowedMethods: [GET, HEAD]
           CachedMethods: [GET, HEAD]
           Compress: true
-          FunctionAssociations:
-            - EventType: viewer-request
-              FunctionARN: !GetAtt ExpiryCheckFunction.FunctionARN
           LambdaFunctionAssociations:
-            - EventType: origin-response
+            - EventType: viewer-request
+              LambdaFunctionARN: !Ref RequestVersion
+            - EventType: viewer-response
               LambdaFunctionARN: !Ref DecrementVersion
         HttpVersion: http2and3
         IPV6Enabled: true
