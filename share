@@ -323,10 +323,14 @@ cmd_upload() {
 
     info "Uploading $(du -sh "$file" | cut -f1) ..."
     local _upload_err
+    local cache_control="public, max-age=3600"
+    [[ -n "$DOWNLOADS" ]] && cache_control="no-store, max-age=0"
+
     if ! _upload_err=$(aws s3 cp "$file" "s3://${TINYSHARE_BUCKET}/${s3_key}" \
         --region "$TINYSHARE_REGION" \
         --content-type "$mime" \
         --content-disposition "attachment; filename=\"${filename}\"" \
+        --cache-control "$cache_control" \
         --metadata "$metadata" \
         --no-progress 2>&1); then
         die "Upload failed: $_upload_err"
