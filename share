@@ -201,6 +201,20 @@ for z in json.load(sys.stdin): print(z['id'].replace('/hostedzone/', ''))
     confirm "Proceed?" || exit 0
     echo ""
 
+    # ── Pre-flight: clear orphaned log bucket so CloudFormation can create it ──
+    local LOG_BUCKET="${BUCKET_NAME}-logs"
+    if aws s3api head-bucket --bucket "$LOG_BUCKET" --profile "$PROFILE" 2>/dev/null; then
+        local log_count
+        log_count=$(aws s3 ls "s3://${LOG_BUCKET}/" --recursive --profile "$PROFILE" 2>/dev/null | wc -l | tr -d ' ')
+        if [[ "$log_count" -eq 0 ]]; then
+            info "Removing empty orphaned log bucket: $LOG_BUCKET"
+            aws s3 rb "s3://${LOG_BUCKET}" --profile "$PROFILE" 2>/dev/null || true
+        else
+            warn "Log bucket $LOG_BUCKET exists with $log_count objects — skipping delete."
+            warn "CloudFormation may fail. Delete manually or run: share teardown first."
+        fi
+    fi
+
     # ── Deploy CloudFormation stack ───────────────────────────────────────────
     local CF_TEMPLATE
     CF_TEMPLATE=$(find_template)
